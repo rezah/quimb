@@ -1,21 +1,26 @@
+"""Functions for decomposing and projecting matrices.
+"""
+
 import functools
+import operator
 
 import numpy as np
-import scipy.linalg as scla
 import scipy.sparse.linalg as spla
 import scipy.linalg.interpolative as sli
 from autoray import (
-    do,
-    reshape,
-    dag,
-    infer_backend,
     astype,
-    get_dtype_name,
-    compose,
     backend_like,
+    compose,
+    dag,
+    do,
+    get_dtype_name,
+    get_lib_fn,
+    infer_backend,
+    lazy,
+    reshape,
 )
 
-from ..core import njit, generated_jit
+from ..core import njit
 from ..linalg import base_linalg
 from ..linalg import rand_linalg
 
@@ -77,21 +82,15 @@ def sgn(x):
     """Get the 'sign' of ``x``, such that ``x / sgn(x)`` is real and
     non-negative.
     """
-    return x / (do('abs', x) + (x == 0.0))
+    x0 = (x == 0.0)
+    return (x + x0) / (do("abs", x) + x0)
 
 
 @sgn.register("numpy")
-@generated_jit
+@njit  # pragma: no cover
 def sgn_numba(x):
-    from numba import types
-    if hasattr(x, "dtype"):
-        dtype = x.dtype
-    else:
-        dtype = x
-    if isinstance(dtype, types.Complex):
-        return lambda x: x / (np.abs(x) + (x == 0.0))
-    else:
-        return lambda x: np.sign(x) + (x == 0.0)
+    x0 = (x == 0.0)
+    return (x + x0) / (np.abs(x) + x0)
 
 
 def _trim_and_renorm_svd_result(
@@ -309,6 +308,83 @@ def svd_truncated_numba(
     return _trim_and_renorm_svd_result_numba(
         U, s, VH, cutoff, cutoff_mode, max_bond, absorb, renorm
     )
+
+
+@svd_truncated.register("autoray.lazy")
+@lazy.core.lazy_cache("svd_truncated")
+def svd_truncated_lazy(
+    x, cutoff=-1.0, cutoff_mode=3, max_bond=-1, absorb=0, renorm=0,
+):
+    if cutoff != 0.0:
+        raise ValueError("Can't handle dynamic cutoffs in lazy mode.")
+
+    m, n = x.shape
+    k = min(m, n)
+    if max_bond > 0:
+        k = min(k, max_bond)
+
+    lsvdt = x.to(
+        fn=get_lib_fn(x.backend, "svd_truncated"),
+        args=(x, cutoff, cutoff_mode, max_bond, absorb, renorm),
+        shape=(3,)
+    )
+
+    U = lsvdt.to(operator.getitem, (lsvdt, 0), shape=(m, k))
+    if absorb is None:
+        s = lsvdt.to(operator.getitem, (lsvdt, 1), shape=(k,))
+    else:
+        s = None
+    VH = lsvdt.to(operator.getitem, (lsvdt, 2), shape=(k, n))
+
+    return U, s, VH
+
+
+@compose
+def lu_truncated(
+    x,
+    cutoff=-1.0,
+    cutoff_mode=3,
+    max_bond=-1,
+    absorb=0,
+    renorm=0,
+    backend=None,
+):
+    if absorb != 0:
+        raise NotImplementedError(
+            f"Can't handle absorb{absorb} in lu_truncated."
+        )
+    elif renorm != 0:
+        raise NotImplementedError(
+            f"Can't handle renorm={renorm} in lu_truncated."
+        )
+    elif max_bond != -1:
+        # use argsort(sl * su) to handle this?
+        raise NotImplementedError(
+            f"Can't handle max_bond={max_bond} in lu_truncated."
+        )
+
+    with backend_like(backend):
+        PL, U = do('scipy.linalg.lu', x, permute_l=True)
+
+        sl = do('sum', do('abs', PL), axis=0)
+        su = do('sum', do('abs', U), axis=1)
+
+        if cutoff_mode == 2:
+            abs_cutoff_l = cutoff * do('max', sl)
+            abs_cutoff_u = cutoff * do('max', su)
+        elif cutoff_mode == 1:
+            abs_cutoff_l = abs_cutoff_u = cutoff
+        else:
+            raise NotImplementedError(
+                f"Can't handle cutoff_mode={cutoff_mode} in lu_truncated."
+            )
+
+        idx = (sl > abs_cutoff_l) & (su > abs_cutoff_u)
+
+        PL = PL[:, idx]
+        U = U[idx, :]
+
+        return PL, None, U
 
 
 def svdvals(x):
@@ -538,6 +614,21 @@ def qr_stabilized_numba(x):
     return Q, None, R
 
 
+@qr_stabilized.register("autoray.lazy")
+@lazy.core.lazy_cache("qr_stabilized")
+def qr_stabilized_lazy(x):
+    m, n = x.shape
+    k = min(m, n)
+    lqrs = x.to(
+        fn=get_lib_fn(x.backend, "qr_stabilized"),
+        args=(x,),
+        shape=(3,),
+    )
+    Q = lqrs.to(operator.getitem, (lqrs, 0), shape=(m, k))
+    R = lqrs.to(operator.getitem, (lqrs, 2), shape=(k, n))
+    return Q, None, R
+
+
 @compose
 def lq_stabilized(x, backend=None):
     with backend_like(backend):
@@ -550,7 +641,6 @@ def lq_stabilized(x, backend=None):
 def lq_stabilized_numba(x):
     Q, _, L = qr_stabilized_numba(x.T)
     return L.T, None, Q.T
-
 
 
 @njit  # pragma: no cover
@@ -571,6 +661,42 @@ def cholesky(x, cutoff=-1, cutoff_mode=3, max_bond=-1, absorb=0):
         # try adding cutoff identity - assuming it is approx allowable error
         xi = x + 2 * cutoff * np.eye(x.shape[0])
         return _cholesky_numba(xi, cutoff, cutoff_mode, max_bond, absorb)
+
+
+@compose
+def polar_right(x):
+    """Polar decomposition of ``x``."""
+    W, s, VH = do("linalg.svd", x)
+    U = W @ VH
+    P = dag(VH) @ ldmul(s, VH)
+    return U, None, P
+
+
+@polar_right.register("numpy")
+@njit  # pragma: no cover
+def polar_right_numba(x):
+    W, s, VH = np.linalg.svd(x, full_matrices=0)
+    U = W @ VH
+    P = dag_numba(VH) @ ldmul_numba(s, VH)
+    return U, None, P
+
+
+@compose
+def polar_left(x):
+    """Polar decomposition of ``x``."""
+    W, s, VH = do("linalg.svd", x)
+    U = W @ VH
+    P = rdmul(W, s) @ dag(W)
+    return P, None, U
+
+
+@polar_left.register("numpy")
+@njit  # pragma: no cover
+def polar_left_numba(x):
+    W, s, VH = np.linalg.svd(x, full_matrices=0)
+    U = W @ VH
+    P = rdmul_numba(W, s) @ dag_numba(W)
+    return P, None, U
 
 
 # ------ similarity transforms for compressing effective environments ------- #
@@ -756,3 +882,170 @@ def similarity_compress(X, max_bond, renorm=True, method="eigh"):
     #     X = np.ascontiguousarray(X)
     fn = _similarity_compress_fns[method, isnumpy]
     return fn(X, max_bond, int(renorm))
+
+
+@compose
+def isometrize_qr(x, backend=None):
+    """Perform isometrization using the QR decomposition."""
+    with backend_like(backend):
+        Q, R = do("linalg.qr", x)
+        # stabilize qr by fixing diagonal of R in canonical, positive form (we
+        # don't actaully do anything to R, just absorb the necessary sign -> Q)
+        rd = do("diag", R)
+        s = do("sign", rd) + (rd == 0)
+        Q = Q * reshape(s, (1, -1))
+        return Q
+
+
+@compose
+def isometrize_svd(x, backend=None):
+    """Perform isometrization using the SVD decomposition."""
+    U, _, VH = do("linalg.svd", x, like=backend)
+    return U @ VH
+
+
+@compose
+def isometrize_exp(x, backend):
+    r"""Perform isometrization using anti-symmetric matrix exponentiation.
+
+    .. math::
+
+            U_A = \exp \left( X - X^\dagger \right)
+
+    If ``x`` is rectangular it is completed with zeros first.
+    """
+    with backend_like(backend):
+        m, n = x.shape
+        d = max(m, n)
+        x = do(
+            "pad", x, [[0, d - m], [0, d - n]], "constant", constant_values=0.0
+        )
+        x = x - dag(x)
+        Q = do("linalg.expm", x)
+        return Q[:m, :n]
+
+
+@compose
+def isometrize_cayley(x, backend):
+    r"""Perform isometrization using an anti-symmetric Cayley transform.
+
+    .. math::
+
+            U_A = (I + \dfrac{A}{2})(I - \dfrac{A}{2})^{-1}
+
+    where :math:`A = X - X^\dagger`. If ``x`` is rectangular it is completed
+    with zeros first.
+    """
+    with backend_like(backend):
+        m, n = x.shape
+        d = max(m, n)
+        x = do(
+            "pad", x, [[0, d - m], [0, d - n]], "constant", constant_values=0.0
+        )
+        x = x - dag(x)
+        x = x / 2.
+        if backend == "torch":
+            # XXX: move device handling upstream in to autoray?
+            Id = do("eye", d, like=x, device=x.device)
+        else:
+            Id = do("eye", d, like=x)
+        Q = do('linalg.solve', Id - x, Id + x)
+        return Q[:m, :n]
+
+
+@compose
+def isometrize_modified_gram_schmidt(A, backend=None):
+    """Perform isometrization explicitly using the modified Gram Schmidt
+    procedure (this is slow but a useful reference).
+    """
+    with backend_like(backend):
+        Q = []
+        for j in range(A.shape[1]):
+            q = A[:, j]
+            for i in range(0, j):
+                rij = do("tensordot", do("conj", Q[i]), q, 1)
+                q = q - rij * Q[i]
+            Q.append(q / do("linalg.norm", q))
+        Q = do("stack", tuple(Q), axis=1)
+        return Q
+
+
+@compose
+def isometrize_householder(X, backend=None):
+    with backend_like(backend):
+        X = do("tril", X, -1)
+        tau = 2. / (1. + do("sum", do("conj", X) * X, 0))
+        Q = do("linalg.householder_product", X, tau)
+        return Q
+
+
+def isometrize_torch_householder(x):
+    """Isometrize ``x`` using the Householder reflection method, as implemented
+    by the ``torch_householder`` package.
+    """
+    from torch_householder import torch_householder_orgqr
+
+    return torch_householder_orgqr(x)
+
+
+_ISOMETRIZE_METHODS = {
+    "qr": isometrize_qr,
+    "svd": isometrize_svd,
+    "mgs": isometrize_modified_gram_schmidt,
+    "exp": isometrize_exp,
+    "cayley": isometrize_cayley,
+    "householder": isometrize_householder,
+    "torch_householder": isometrize_torch_householder,
+}
+
+
+def isometrize(x, method="qr"):
+    """Generate an isometric (or unitary if square) / orthogonal matrix from
+    array ``x``.
+
+    Parameters
+    ----------
+    x : array
+        The matrix to project into isometrix form.
+    method : str, optional
+        The method used to generate the isometry. The options are:
+
+        - "qr": use the Q factor of the QR decomposition of ``x`` with the
+          constraint that the diagonal of ``R`` is positive.
+        - "svd": uses ``U @ VH`` of the SVD decomposition of ``x``. This is
+          useful for finding the 'closest' isometric matrix to ``x``, such as
+          when it has been expanded with noise etc. But is less stable for
+          differentiation / optimization.
+        - "exp": use the matrix exponential of ``x - dag(x)``, first
+          completing ``x`` with zeros if it is rectangular. This is a good
+          parametrization for optimization, but more expensive for non-square
+          ``x``.
+        - "cayley": use the Cayley transform of ``x - dag(x)``, first
+          completing ``x`` with zeros if it is rectangular. This is a good
+          parametrization for optimization (one the few compatible with
+          `HIPS/autograd` e.g.), but more expensive for non-square ``x``.
+        - "householder": use the Householder reflection method directly. This
+          requires that the backend implements "linalg.householder_product".
+        - "torch_householder": use the Householder reflection method directly,
+          using the ``torch_householder`` package. This requires that the
+          package is installed and that the backend is ``"torch"``. This is
+          generally the best parametrizing method for "torch" if available.
+        - "mgs": use a python implementation of the modified Gram Schmidt
+          method directly. This is slow if not compiled but a useful reference.
+
+        Not all backends support all methods or differentiating through all
+        methods.
+
+    Returns
+    -------
+    Q : array
+        The isometrization / orthogonalization of ``x``.
+    """
+    m, n = x.shape
+    fat = m < n
+    if fat:
+        x = do("transpose", x)
+    Q = _ISOMETRIZE_METHODS[method](x)
+    if fat:
+        Q = do("transpose", Q)
+    return Q

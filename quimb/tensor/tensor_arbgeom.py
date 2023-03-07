@@ -1,3 +1,6 @@
+"""Classes and algorithms related to arbitrary geometry tensor networks.
+"""
+
 import functools
 from operator import add
 
@@ -5,18 +8,13 @@ from autoray import do, dag
 
 from ..utils import check_opt, deprecated, ensure_dict
 from ..utils import progbar as Progbar
-from ..core import prod
 from .tensor_core import (
-    Tensor,
     TensorNetwork,
     get_symbol,
     rand_uuid,
-    IsoTensor,
     oset,
-    oset_union,
     tags_to_oset,
 )
-from . import array_ops as ops
 
 
 def get_coordinate_formatter(ndims):
@@ -323,6 +321,14 @@ class TensorNetworkGen(TensorNetwork):
         tags = self.maybe_convert_coo(tags)
         return super()._get_tids_from_tags(tags, which=which)
 
+    def reset_cached_properties(self):
+        """Reset any cached properties, one should call this when changing the
+        actual geometry of a TN inplace, for example.
+        """
+        self._site_set = None
+        self._site_tag_set = None
+        self._site_tags = None
+
     @functools.wraps(tensor_network_align)
     def align(self, *args, inplace=False, **kwargs):
         return tensor_network_align(self, *args, inplace=inplace, **kwargs)
@@ -451,6 +457,13 @@ class TensorNetworkGenVector(TensorNetworkGen):
         """All of the site inds still present in this tensor network.
         """
         return tuple(map(self.site_ind, self.gen_sites_present()))
+
+    def reset_cached_properties(self):
+        """Reset any cached properties, one should call this when changing the
+        actual geometry of a TN inplace, for example.
+        """
+        self._site_inds = None
+        return super().reset_cached_properties()
 
     def reindex_sites(self, new_id, where=None, inplace=False):
         """Modify the site indices for all or some tensors in this vector
@@ -989,7 +1002,7 @@ class TensorNetworkGenVector(TensorNetworkGen):
                     optimize, output_inds=k_inds + b_inds)
 
         rho = tn.to_dense(k_inds, b_inds, optimize=optimize, **contract_opts)
-        expec = do("trace", rho @ G)
+        expec = do("tensordot", rho, G, axes=((0, 1), (1, 0)))
         if normalized:
             expec = expec / do("trace", rho)
 
@@ -1278,7 +1291,7 @@ class TensorNetworkGenVector(TensorNetworkGen):
         if rehearse:
             return rho
 
-        return do("trace", rho @ G)
+        return do("tensordot", rho, G, axes=((0, 1), (1, 0)))
 
     def compute_local_expectation(
         self,

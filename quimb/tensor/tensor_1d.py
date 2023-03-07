@@ -1,7 +1,6 @@
 """Classes and algorithms related to 1D tensor networks.
 """
 
-import re
 import operator
 import functools
 from math import log2
@@ -11,7 +10,7 @@ import scipy.sparse.linalg as spla
 from autoray import do, dag, reshape, conj, get_dtype_name, transpose
 
 from ..utils import (
-    check_opt, print_multi_line, ensure_dict, partition_all, deprecated
+    print_multi_line, ensure_dict, partition_all, deprecated
 )
 import quimb as qu
 from .tensor_core import (
@@ -19,11 +18,8 @@ from .tensor_core import (
     TensorNetwork,
     rand_uuid,
     bonds,
-    bonds_size,
     oset,
     tags_to_oset,
-    get_tags,
-    PTensor,
 )
 from .tensor_arbgeom import (
     TensorNetworkGen,
@@ -657,6 +653,7 @@ class TensorNetwork1DOperator(TensorNetwork1D, TensorNetworkGenOperator):
 
     reindex_upper_sites_ = functools.partialmethod(
         reindex_upper_sites, inplace=True)
+
 
 def set_default_compress_mode(opts, cyclic=False):
     opts.setdefault('cutoff_mode', 'rel' if cyclic else 'rsum2')
@@ -1405,6 +1402,8 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         split_opts
             Supplied to :func:`~quimb.tensor.tensor_core.tensor_split` to
             in order to partition the dense vector into tensors.
+            ``absorb='left'`` is set by default, to ensure the compression
+            is canonical / optimal.
 
         Returns
         -------
@@ -1422,11 +1421,11 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
             | | | | | |
         """
         set_default_compress_mode(split_opts)
+        # ensure compression is canonical / optimal
+        split_opts.setdefault("absorb", "left")
 
         L = len(dims)
         inds = [site_ind_id.format(i) for i in range(L)]
-
-        T = Tensor(reshape(ops.asarray(psi), dims), inds=inds)
 
         def gen_tensors():
             #           split
@@ -1436,18 +1435,34 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
             #     |||||||  | | |
             #     .......
             #    left_inds
-            TM = T
+            tm = Tensor(
+                data=reshape(ops.asarray(psi), dims),
+                inds=inds,
+            )
             for i in range(L - 1, 0, -1):
-                TM, TR = TM.split(left_inds=inds[:i], get='tensors',
-                                  rtags=site_tag_id.format(i), **split_opts)
-                yield TR
-            TM.add_tag(site_tag_id.format(0))
-            yield TM
+                tm, tr = tm.split(
+                    left_inds=inds[:i],
+                    get='tensors',
+                    rtags=site_tag_id.format(i),
+                    **split_opts
+                )
+                yield tr
+            tm.add_tag(site_tag_id.format(0))
+            yield tm
 
-        tn = TensorNetwork(gen_tensors())
-        return cls.from_TN(tn, cyclic=False, L=L,
-                           site_ind_id=site_ind_id,
-                           site_tag_id=site_tag_id)
+        # the reverse is purely asthetic so the tensors are stored in the
+        # TN dictionary in the same order as the sites
+        ts = tuple(gen_tensors())[::-1]
+
+        mps = TensorNetwork(ts)
+        # cast as correct TN class
+        return mps.view_as_(
+            cls,
+            L=L,
+            cyclic=False,
+            site_ind_id=site_ind_id,
+            site_tag_id=site_tag_id,
+        )
 
     def add_MPS(self, other, inplace=False, compress=False, **compress_opts):
         """Add another MatrixProductState to this one.
@@ -1742,6 +1757,23 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         gate_with_auto_swap,
         inplace=True,
     )
+
+    def flip(self, inplace=False):
+        """Reverse the order of the sites in the MPS, such that site ``i`` is
+        now at site ``L - i - 1``.
+        """
+        flipped = self if inplace else self.copy()
+
+        retag_map = {
+            self.site_tag(i): self.site_tag(self.L - i - 1)
+            for i in self.sites
+        }
+        reindex_map = {
+            self.site_ind(i): self.site_ind(self.L - i - 1)
+            for i in self.sites
+        }
+
+        return flipped.retag_(retag_map).reindex_(reindex_map)
 
     def magnetization(self, i, direction='Z', cur_orthog=None):
         """Compute the magnetization at site ``i``.

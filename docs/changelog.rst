@@ -3,10 +3,74 @@ Changelog
 
 Release notes for ``quimb``.
 
+.. _whats-new.1.4.3:
+
+v1.4.3 (unreleased)
+-------------------
+
+**Enhancements**
+
+- refactor 'isometrize' methods including new "cayley", "householder" and
+  "torch_householder" methods. See :func:`quimb.tensor.decomp.isometrize`.
+- add :meth:`~quimb.tensor.tensor_core.TensorNetwork.compute_reduced_factor`
+  and :meth:`~quimb.tensor.tensor_core.TensorNetwork.insert_compressor_between_regions`
+  methos, for some RG style algorithms.
+- add the ``mode="projector"`` option for 2D tensor network contractions
+- add HOTRG style coarse graining and contraction in 2D and 3D. See
+  :meth:`~quimb.tensor.tensor_2d.TensorNetwork2D.coarse_grain_hotrg`,
+  :meth:`~quimb.tensor.tensor_2d.TensorNetwork2D.contract_hotrg`,
+  :meth:`~quimb.tensor.tensor_3d.TensorNetwork3D.coarse_grain_hotrg`, and
+  :meth:`~quimb.tensor.tensor_3d.TensorNetwork3D.contract_hotrg`,
+- add CTMRG style contraction for 2D tensor networks:
+  :meth:`~quimb.tensor.tensor_2d.TensorNetwork2D.contract_ctmrg`
+- add 2D tensor network 'corner double line' (CDL) builders:
+  :func:`~quimb.tensor.tensor_builder.TN2D_corner_double_line`
+- update the docs to use the `furo <https://pradyunsg.me/furo/>`_ theme,
+  `myst_nb <https://myst-nb.readthedocs.io/en/latest/>`_ for notebooks, and
+  several other `sphinx` extensions.
+- add the `'adabelief'` optimizer to
+  :class:`~quimb.tensor.optimize.TNOptimizer` as well as a quick plotter:
+  :meth:`~quimb.tensor.optimize.TNOptimizer.plot`
+- add initial 3D plotting methods for tensors networks (
+  ``TensorNetwork.draw(dim=3, backend='matplotlib3d')`` or
+  ``TensorNetwork.draw(dim=3, backend='plotly')``
+  ). The new ``backend='plotly'`` can also be used for 2D interactive plots.
+- Update :func:`~quimb.tensor.tensor_builder.HTN_from_cnf` to handle more
+  weighted model counting formats.
+- Add :func:`~quimb.tensor.tensor_builder.cnf_file_parse`
+- Add :func:`~quimb.tensor.tensor_builder.random_ksat_instance`
+- Add :func:`~quimb.tensor.tensor_builder.TN_from_strings`
+- Add :func:`~quimb.tensor.tensor_builder.convert_to_2d`
+- Add :func:`~quimb.tensor.tensor_builder.TN2D_rand_hidden_loop`
+- Add :func:`~quimb.tensor.tensor_builder.convert_to_3d`
+- Add :func:`~quimb.tensor.tensor_builder.TN3D_corner_double_line`
+- Add :func:`~quimb.tensor.tensor_builder.TN3D_rand_hidden_loop`
+- various optimizations for minimizing computational graph size and
+  construction time.
+- add ``'lu'``, ``'polar_left'`` and ``'polar_right'`` methods to
+  :func:`~quimb.tensor.tensor_core.tensor_split`.
+- add experimental arbitrary hamilotonian MPO building
+
+
+**Bug fixes:**
+
+- fix :func:`~quimb.tensor.decomp.qr_stabilized` bug for strictly upper
+  triangular R factors.
+
+.. _whats-new.1.4.2:
+
+v1.4.2 (28th November 2022)
+---------------------------
+
+**Enhancements**
+
+- move from versioneer to to
+  `setuptools_scm <https://pypi.org/project/setuptools-scm/>`_ for versioning
+
 .. _whats-new.1.4.1:
 
-v1.4.1 (unreleased)
-----------------------
+v1.4.1 (28th November 2022)
+---------------------------
 
 **Enhancements**
 
@@ -22,6 +86,16 @@ v1.4.1 (unreleased)
 - tweak default gauging options of compressed contraction
 - add :meth:`~quimb.tensor.tensor_core.TensorNetwork.compute_hierarchical_grouping`
 - add :meth:`~quimb.tensor.tensor_core.Tensor.as_network`
+- add :meth:`~quimb.tensor.tensor_core.TensorNetwork.inds_size`
+- add :meth:`~quimb.tensor.tensor_core.TensorNetwork.get_hyperinds`
+- add :meth:`~quimb.tensor.tensor_core.TensorNetwork.outer_size`
+- improve :meth:`~quimb.tensor.tensor_core.TensorNetwork.group_inds`
+- refactor tensor decompositiona and 'isometrization' methods
+- begin supporting pytree specifications in `TNOptimizer`, e.g. for constants
+- add `experimental` submodule for new sharing features
+- register tensor and tensor network objects with `jax` pytree interface
+  (:pull:`150`)
+- update CI infrastructure
 
 **Bug fixes:**
 
@@ -32,7 +106,7 @@ v1.4.1 (unreleased)
 .. _whats-new.1.4.0:
 
 v1.4.0 (14th June 2022)
-----------------------
+-----------------------
 
 **Enhancements**
 

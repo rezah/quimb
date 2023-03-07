@@ -22,21 +22,21 @@ from ..utils import (
 )
 from . import array_ops as ops
 from .tensor_core import (
-    Tensor,
-    bonds,
-    rand_uuid,
-    oset,
-    tags_to_oset,
-    TensorNetwork,
-    tensor_contract,
-    oset_union,
     bonds_size,
+    bonds,
+    oset_union,
+    oset,
+    rand_uuid,
+    tags_to_oset,
+    tensor_contract,
+    Tensor,
+    TensorNetwork,
 )
 from .tensor_arbgeom import (
+    tensor_network_apply_op_vec,
     TensorNetworkGen,
-    TensorNetworkGenVector,
     TensorNetworkGenOperator,
-    tensor_network_apply_op_vec
+    TensorNetworkGenVector,
 )
 from .tensor_1d import maybe_factor_gate_into_tensor
 from . import decomp
@@ -51,7 +51,7 @@ def nearest_neighbors(coo):
     return ((i - 1, j), (i, j - 1), (i, j + 1), (i + 1, j))
 
 
-def gen_2d_bonds(Lx, Ly, steppers, coo_filter=None):
+def gen_2d_bonds(Lx, Ly, steppers=None, coo_filter=None):
     """Convenience function for tiling pairs of bond coordinates on a 2D
     lattice given a function like ``lambda i, j: (i + 1, j + 1)``.
 
@@ -61,9 +61,10 @@ def gen_2d_bonds(Lx, Ly, steppers, coo_filter=None):
         The number of rows.
     Ly : int
         The number of columns.
-    steppers : callable or sequence of callable
+    steppers : callable or sequence of callable, optional
         Function(s) that take args ``(i, j)`` and generate another coordinate,
-        thus defining a bond.
+        thus defining a bond. Only valid steps are taken. If not given,
+        defaults to nearest neighbor bonds.
     coo_filter : callable
         Function that takes args ``(i, j)`` and only returns ``True`` if this
         is to be a valid starting coordinate.
@@ -95,6 +96,11 @@ def gen_2d_bonds(Lx, Ly, steppers, coo_filter=None):
         ((0, 1), (1, 0))
 
     """
+    if steppers is None:
+        steppers = [
+            lambda i, j: (i, j + 1),
+            lambda i, j: (i + 1, j),
+        ]
 
     if callable(steppers):
         steppers = (steppers,)
@@ -107,13 +113,109 @@ def gen_2d_bonds(Lx, Ly, steppers, coo_filter=None):
                     yield (i, j), (i2, j2)
 
 
+def gen_2d_plaquette(coo0, steps):
+    """Generate a plaquette at site ``coo0`` by stepping first in ``steps`` and
+    then the reverse steps.
+
+    Parameters
+    ----------
+    coo0 : tuple
+        The coordinate of the first site in the plaquette.
+    steps : tuple
+        The steps to take to generate the plaquette. Each element should be
+        one of ``('x+', 'x-', 'y+', 'y-')``.
+
+    Yields
+    ------
+    coo : tuple
+        The coordinates of the sites in the plaquette, including the last
+        site which will be the same as the first.
+    """
+    x, y = coo0
+    smap = {'+': +1, '-': -1}
+    step_backs = []
+    yield x, y
+    for step in steps:
+        d, s = step
+        x, y = {
+            'x': (x + smap[s], y),
+            'y': (x, y + smap[s]),
+        }[d]
+        yield x, y
+        step_backs.append(d + '-' if s == '+' else '-')
+    for step in step_backs:
+        d, s = step
+        x, y = {
+            'x': (x + smap[s], y),
+            'y': (x, y + smap[s]),
+        }[d]
+        yield x, y
+
+
+def gen_2d_plaquettes(Lx, Ly, tiling):
+    """Generate a tiling of plaquettes in a square 2D lattice.
+
+    Parameters
+    ----------
+    Lx : int
+        The length of the lattice in the x direction.
+    Ly : int
+        The length of the lattice in the y direction.
+    tiling : {'1', '2', 'full'}
+        The tiling to use:
+
+        - '1': plaquettes in a checkerboard pattern, such that each edge
+            is covered by a maximum of one plaquette.
+        - '2' or 'full': dense tiling of plaquettes. All bulk edges will
+            be covered twice.
+
+    Yields
+    ------
+    plaquette : tuple[tuple[int]]
+        The coordinates of the sites in each plaquette, including the last
+        site which will be the same as the first.
+    """
+    if str(tiling) == '1':
+        for x, y in product(range(Lx), range(Ly)):
+            if ((x + y) % 2 == 0) and (x < Lx - 1 and y < Ly - 1):
+                yield tuple(gen_2d_plaquette((x, y), ('x+', 'y+')))
+    elif str(tiling) in ('2', "full"):
+        for x, y in product(range(Lx), range(Ly)):
+            if (x < Lx - 1 and y < Ly - 1):
+                yield tuple(gen_2d_plaquette((x, y), ('x+', 'y+')))
+    else:
+        raise ValueError("`tiling` must be one of: '1', '2', 'full'.")
+
+
+def gen_2d_strings(Lx, Ly):
+    """Generate all length-wise strings in a square 2D lattice.
+    """
+    for x in range(Lx):
+        yield tuple((x, y) for y in range(Ly))
+    for y in range(Ly):
+        yield tuple((x, y) for x in range(Lx))
+
+
 class Rotator2D:
     """Object for rotating coordinates and various contraction functions so
     that the core algorithms only have to written once, but nor does the actual
     TN have to be modified.
+
+    Parameters
+    ----------
+    tn : TensorNetwork2D
+        The tensor network to rotate coordinates for.
+    xrange : tuple[int, int]
+        The range of x-coordinates to range over.
+    yrange : tuple[int, int]
+        The range of y-coordinates to range over.
+    from_which : {'xmin', 'xmax', 'ymin', 'ymax'}
+        The direction to sweep from.
+    stepsize : int, optional
+        The step size to use when sweeping.
     """
 
-    def __init__(self, tn, xrange, yrange, from_which):
+    def __init__(self, tn, xrange, yrange, from_which, stepsize=1):
         check_opt('from_which', from_which, {'xmin', 'xmax', 'ymin', 'ymax'})
 
         if xrange is None:
@@ -144,12 +246,14 @@ class Rotator2D:
 
         if 'min' in self.from_which:
             # -> sweeps are increasing
-            self.sweep = range(self.imin, self.imax + 1, +1)
-            self.istep = +1
+            self.sweep = range(self.imin, self.imax + 1, +stepsize)
+            self.istep = +stepsize
         else:  # 'max'
             # -> sweeps are decreasing
-            self.sweep = range(self.imax, self.imin - 1, -1)
-            self.istep = -1
+            self.sweep = range(self.imax, self.imin - 1, -stepsize)
+            self.istep = -stepsize
+
+        self.sweep_other = range(self.jmin, self.jmax + 1)
 
     def get_opposite_env_fn(self):
         """Get the function and location label for contracting boundaries in
@@ -925,14 +1029,13 @@ class TensorNetwork2D(TensorNetworkGen):
         r2d = Rotator2D(self, xrange, yrange, from_which)
         site_tag = r2d.site_tag
         plane, istep = r2d.plane, r2d.istep
-        jmin, jmax = r2d.jmin, r2d.jmax
 
         if layer_tags is None:
             layer_tags = [None]
 
         for i in r2d.sweep[:-1]:
             for layer_tag in layer_tags:
-                for j in range(jmin, jmax + 1):
+                for j in r2d.sweep_other:
 
                     tag1 = site_tag(i, j)  # outer
                     tag2 = site_tag(i + istep, j)  # inner
@@ -1102,7 +1205,7 @@ class TensorNetwork2D(TensorNetworkGen):
         for i in r2d.sweep[:-1]:
 
             # contract inwards, no compression
-            for j in range(jmin, jmax + 1):
+            for j in r2d.sweep_other:
                 #
                 #             j  j+1   ...
                 #         │   │   │   │   │   │
@@ -1198,6 +1301,99 @@ class TensorNetwork2D(TensorNetworkGen):
                 self.insert_gauge(
                     Cr, [site_tag(i, j)], [site_tag(i, j + 1)], Cl)
 
+    def _contract_boundary_projector(
+        self,
+        xrange,
+        yrange,
+        from_which,
+        max_bond=None,
+        cutoff=1e-10,
+        lazy=False,
+        equalize_norms=False,
+        optimize="auto-hq",
+        compress_opts=None,
+    ):
+        """Contract the boundary of this 2D tensor network by explicitly
+        computing and inserting explicit local projector tensors, which can
+        optionally be left uncontracted. Multilayer networks are naturally
+        supported.
+
+        Parameters
+        ----------
+        xrange : tuple
+            The range of x indices to contract.
+        yrange : tuple
+            The range of y indices to contract.
+        from_which : {'xmin', 'xmax', 'ymin', 'ymax'}
+            From which boundary to contract.
+        max_bond : int, optional
+            The maximum bond dimension to contract to. If ``None`` (default),
+            compression is left to ``cutoff``.
+        cutoff : float, optional
+            The cutoff to use for boundary compression.
+        lazy : bool, optional
+            Whether to leave the boundary tensors uncontracted. If ``False``
+            (the default), the boundary tensors are contracted and the
+            resulting boundary has a single tensor per site.
+        equalize_norms : bool, optional
+            Whether to actively absorb the norm of modified tensors into
+            ``self.exponent``.
+        optimize : str or PathOptimizer, optional
+            The contract path optimization to use when forming the projector
+            tensors.
+        compress_opts : dict, optional
+            Other options to pass to
+            :func:`~quimb.tensor.decomp.svd_truncated`.
+
+        See Also
+        --------
+        TensorNetwork.insert_compressor_between_regions
+        """
+        compress_opts = ensure_dict(compress_opts)
+
+        # we compute the projectors from an untouched copy
+        tn_calc = self.copy()
+
+        r = Rotator2D(self, xrange, yrange, from_which)
+        i0, i1 = r.sweep[:2]
+        j0 = r.sweep_other[0]
+
+        for j in r.sweep_other:
+
+            tag_ij = r.site_tag(i0, j)
+            tag_ip1j = r.site_tag(i1, j)
+
+            if j != j0:
+                ltags = r.site_tag(i0, j - 1), r.site_tag(i1, j - 1)
+                rtags = (tag_ij, tag_ip1j)
+                #      │         │
+                #    ──O─┐ chi ┌─O──  i+1
+                #      │ └─▷═◁─┘ │
+                #      │ ┌┘   └┐ │
+                #    ──O─┘     └─O──  i
+                #     j-1        j
+                tn_calc.insert_compressor_between_regions(
+                    ltags,
+                    rtags,
+                    new_ltags=ltags,
+                    new_rtags=rtags,
+                    insert_into=self,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    **compress_opts,
+                )
+
+        if not lazy:
+            # contract each pair of boundary tensors with their projectors
+            for j in r.sweep_other:
+                self.contract_tags_(
+                    (r.site_tag(i0, j), r.site_tag(i1, j)), optimize=optimize,
+                )
+
+        if equalize_norms:
+            for t in self.select_tensors(r.x_tag(i1)):
+                self.strip_exponent(t, equalize_norms)
+
     def contract_boundary_from(
         self,
         xrange,
@@ -1217,7 +1413,7 @@ class TensorNetwork2D(TensorNetworkGen):
         """Unified entrypoint for contracting any rectangular patch of tensors
         from any direction, with any boundary method.
         """
-        check_opt('mode', mode, {'mps', 'full-bond'})
+        check_opt('mode', mode, ('mps', 'projector', 'full-bond'))
 
         tn = self if inplace else self.copy()
 
@@ -1231,12 +1427,17 @@ class TensorNetwork2D(TensorNetworkGen):
             tn._contract_boundary_full_bond(**contract_boundary_opts)
             return tn
 
-        # mps mode options
         contract_boundary_opts["cutoff"] = cutoff
+        contract_boundary_opts["compress_opts"] = compress_opts
+
+        if mode == 'projector':
+            tn._contract_boundary_projector(**contract_boundary_opts)
+            return tn
+
+        # mode == 'mps' options
         contract_boundary_opts["canonize"] = canonize
         contract_boundary_opts["layer_tags"] = layer_tags
         contract_boundary_opts["sweep_reverse"] = sweep_reverse
-        contract_boundary_opts["compress_opts"] = compress_opts
         self._contract_boundary_core(**contract_boundary_opts)
 
         return tn
@@ -1954,8 +2155,46 @@ class TensorNetwork2D(TensorNetworkGen):
         envs=None,
         **contract_boundary_opts
     ):
-        """Compute the ``self.Lx`` 1D boundary tensor networks describing
-        the environments of rows and columns.
+        """Compute the 1D boundary tensor networks describing the environments
+        of rows and columns.
+
+        Parameters
+        ----------
+        from_which : {'xmin', 'xmax', 'ymin', 'ymax'}
+            Which boundary to compute the environments from.
+        xrange : tuple[int], optional
+            The range of rows to compute the environments for.
+        yrange : tuple[int], optional
+            The range of columns to compute the environments for.
+        max_bond : int, optional
+            The maximum bond dimension of the environments.
+        cutoff : float, optional
+            The cutoff for the singular values of the environments.
+        canonize : bool, optional
+            Whether to canonicalize along each MPS environment before
+            compressing.
+        mode : {'mps', 'projector', 'full-bond'}, optional
+            Which contraction method to use for the environments.
+        layer_tags : str or iterable[str], optional
+            If this 2D TN is multi-layered (e.g. a bra and a ket), and
+            ``mode == 'mps'``, contract and compress each specified layer
+            separately, for a cheaper contraction.
+        dense : bool, optional
+            Whether to use dense tensors for the environments.
+        compress_opts : dict, optional
+            Other options to pass to
+            :func:`~quimb.tensor.tensor_core.tensor_compress_bond`.
+        envs : dict, optional
+            An existing dictionary to store the environments in.
+        contract_boundary_opts
+            Other options to pass to
+            :meth:`~quimb.tensor.tensor_2d.TensorNetwork2D.contract_boundary_from`.
+
+        Returns
+        -------
+        envs : dict
+            A dictionary of the environments, with keys of the form
+            ``(from_which, row_or_col_index)``.
         """
         tn = self.copy()
 
@@ -2556,6 +2795,288 @@ class TensorNetwork2D(TensorNetworkGen):
             compress_opts=compress_opts, second_dense=second_dense,
             **compute_environment_opts)
 
+    def coarse_grain_hotrg(
+        self,
+        direction,
+        max_bond=None,
+        cutoff=1e-10,
+        lazy=False,
+        equalize_norms=False,
+        optimize="auto-hq",
+        compress_opts=None,
+        inplace=False,
+    ):
+        """Coarse grain this tensor network in ``direction`` using HOTRG. This
+        inserts oblique projectors between tensor pairs and then optionally
+        contracts them into new sites for form a lattice half the size.
+
+        Parameters
+        ----------
+        direction : {'x', 'y'}
+            The direction to coarse grain in.
+        max_bond : int, optional
+            The maximum bond dimension of the projector pairs inserted.
+        cutoff : float, optional
+            The cutoff for the singular values of the projector pairs.
+        lazy : bool, optional
+            Whether to contract the coarse graining projectors or leave them
+            in the tensor network lazily. Default is to contract them.
+        equalize_norms : bool, optional
+            Whether to equalize the norms of the tensors in the coarse grained
+            lattice.
+        optimize : str, optional
+            The optimization method to use when contracting the coarse grained
+            lattice, if ``lazy=False``.
+        compress_opts : None or dict, optional
+            Supplied to
+            :meth:`~quimb.tensor.tensor_core.TensorNetwork.insert_compressor_between_regions`.
+        inplace : bool, optional
+            Whether to perform the coarse graining in place.
+
+        Returns
+        -------
+        TensorNetwork2D
+            The coarse grained tensor network, with size halved in
+            ``direction``.
+
+        See Also
+        --------
+        contract_hotrg, TensorNetwork.insert_compressor_between_regions
+        """
+        compress_opts = ensure_dict(compress_opts)
+        check_opt("direction", direction, ("x", "y"))
+
+        tn = self if inplace else self.copy()
+        tn_calc = tn.copy()
+
+        r = Rotator2D(tn, None, None, direction + "min")
+
+        # track new coordinates / tags
+        retag_map = {}
+
+        for i in range(r.imin, r.imax + 1, 2):
+
+            next_i_in_lattice = (i + 1 <= r.imax)
+
+            for j in range(r.jmin, r.jmax + 1):
+                #      │         │
+                #    ──O─┐ chi ┌─O──  i+1
+                #      │ └─▷═◁─┘ │
+                #      │ ┌┘   └┐ │
+                #    ──O─┘     └─O──  i
+                #      │         │
+                #     j-1        j
+                tag_ij = r.site_tag(i, j)
+                tag_ip1j = r.site_tag(i + 1, j)
+                new_tag = r.site_tag(i // 2, j)
+                retag_map[tag_ij] = new_tag
+                if next_i_in_lattice:
+                    retag_map[tag_ip1j] = new_tag
+
+                if (j > 0) and next_i_in_lattice:
+                    ltags = r.site_tag(i, j - 1), r.site_tag(i + 1, j - 1)
+                    rtags = (tag_ij, tag_ip1j)
+                    tn_calc.insert_compressor_between_regions(
+                        ltags,
+                        rtags,
+                        new_ltags=ltags,
+                        new_rtags=rtags,
+                        insert_into=tn,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        **compress_opts,
+                    )
+
+            retag_map[r.x_tag(i)] = r.x_tag(i // 2)
+            if next_i_in_lattice:
+                retag_map[r.x_tag(i + 1)] = r.x_tag(i // 2)
+
+        # then we retag the tensor network and adjust its size
+        tn.retag_(retag_map)
+        if direction == "x":
+            tn._Lx = tn.Lx // 2 + tn.Lx % 2
+        else:  # 'y'
+            tn._Ly = tn.Ly // 2 + tn.Ly % 2
+
+        # need this since we've fundamentally changed the geometry
+        tn.reset_cached_properties()
+
+        if not lazy:
+            # contract each pair of tensors with their projectors
+            for st in tn.site_tags:
+                tn.contract_tags_(st, optimize=optimize)
+
+        if equalize_norms:
+            tn.equalize_norms_(value=equalize_norms)
+
+        return tn
+
+    coarse_grain_hotrg_ = functools.partialmethod(
+        coarse_grain_hotrg, inplace=True
+    )
+
+    def contract_hotrg(
+        self,
+        max_bond=None,
+        cutoff=1e-10,
+        directions=("x", "y"),
+        lazy=False,
+        equalize_norms=False,
+        inplace=False,
+        **coarse_grain_opts
+    ):
+        """Contract this tensor network using the finite version of HOTRG.
+        See https://arxiv.org/abs/1201.1144v4 and
+        https://arxiv.org/abs/1905.02351 for the more optimal computaton of the
+        projectors used here. The TN is contracted sequentially in
+        ``directions`` by inserting oblique projectors between plaquettes, and
+        then optionally contracting these new effective sites. The algorithm
+        stops when only one direction has a length larger than 2, and thus
+        exact contraction can be used.
+
+        Parameters
+        ----------
+        max_bond : int, optional
+            The maximum bond dimension of the projector pairs inserted.
+        cutoff : float, optional
+            The cutoff for the singular values of the projector pairs.
+        directions : tuple of str, optional
+            The directions to contract in.  Default is to contract in all
+            directions.
+        lazy : bool, optional
+            Whether to contract the coarse graining projectors or leave them
+            in the tensor network lazily. Default is to contract them.
+        equalize_norms : bool or float, optional
+            Whether to equalize the norms of the tensors in the tensor network
+            after each coarse graining step.
+        inplace : bool, optional
+            Whether to perform the coarse graining in place.
+        coarse_grain_opts
+            Additional options to pass to :meth:`coarse_grain_hotrg`.
+
+        Returns
+        -------
+        TensorNetwork2D
+            The contracted tensor network, which will have no more than one
+            direction of length > 2.
+
+        See Also
+        --------
+        coarse_grain_hotrg, contract_ctmrg,
+        TensorNetwork.insert_compressor_between_regions
+        """
+        tn = self if inplace else self.copy()
+
+        # contract until only a single length is non-1D, (i.e. L>2 )
+        directions = [d for d in directions if getattr(tn, "L" + d) > 2]
+        while len(directions) > 1:
+            direction = directions.pop(0)
+            tn.coarse_grain_hotrg_(
+                direction=direction,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                lazy=lazy,
+                equalize_norms=equalize_norms,
+                **coarse_grain_opts
+            )
+            if getattr(tn, "L" + direction) > 2:
+                directions.append(direction)
+
+        return tn
+
+    def contract_ctmrg(
+        self,
+        max_bond=None,
+        cutoff=1e-10,
+        directions=("xmin", "xmax", "ymin", "ymax"),
+        lazy=False,
+        equalize_norms=False,
+        inplace=False,
+        **contract_boundary_opts,
+    ):
+        """Contract this 2D tensor network using the finite analog of the
+        CTMRG algorithm - https://arxiv.org/abs/cond-mat/9507087. The TN is
+        contracted sequentially in ``directions`` by inserting oblique
+        projectors between boundary pairs, and then optionally contracting
+        these new effective sites. The algorithm stops when only one direction
+        has a length larger than 2, and thus exact contraction can be used.
+
+        Parameters
+        ----------
+        max_bond : int, optional
+            The maximum bond dimension of the projector pairs inserted.
+        cutoff : float, optional
+            The cutoff for the singular values of the projector pairs.
+        directions : tuple of str, optional
+            The directions to contract in.  Default is to contract in all
+            directions.
+        lazy : bool, optional
+            Whether to contract the boundary projectors or leave them
+            in the tensor network lazily. Default is to contract them.
+        equalize_norms : bool or float, optional
+            Whether to equalize the norms of the tensors in the tensor network
+            after each boundary contraction step.
+        inplace : bool, optional
+            Whether to perform the boundary contraction in place.
+        contract_boundary_opts
+            Additional options to pass to :meth:`contract_boundary_from`.
+
+        Returns
+        -------
+        TensorNetwork2D
+            The contracted tensor network, which will have no more than one
+            direction of length > 2.
+
+        See Also
+        --------
+        contract_boundary_from, contract_hotrg,
+        TensorNetwork.insert_compressor_between_regions
+        """
+        tn = self if inplace else self.copy()
+
+        contract_boundary_opts.setdefault("mode", "projector")
+
+        boundaries = {
+            "xmin": 0,
+            "xmax": tn.Lx - 1,
+            "ymin": 0,
+            "ymax": tn.Ly - 1,
+        }
+        separations = {
+            "x": tn.Lx - 1,
+            "y": tn.Ly - 1,
+        }
+
+        directions = [d for d in directions if separations[d[0]] > 1]
+
+        while directions:
+            direction = directions.pop(0)
+            if separations[direction[0]] <= 1:
+                continue
+            else:
+                directions.append(direction)
+
+            xrange = (boundaries["xmin"], boundaries["xmax"])
+            yrange = (boundaries["ymin"], boundaries["ymax"])
+
+            tn.contract_boundary_from_(
+                xrange, yrange,
+                from_which=direction,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                lazy=lazy,
+                equalize_norms=equalize_norms,
+                **contract_boundary_opts,
+            )
+
+            xy, minmax = direction[0], direction[1:]
+            separations[xy] -= 1
+            if minmax == "min":
+                boundaries[direction] += 1
+            else:
+                boundaries[direction] -= 1
+
+        return tn
 
 def is_lone_coo(where):
     """Check if ``where`` has been specified as a single coordinate pair.
@@ -2995,7 +3516,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             site_tids = psi._get_tids_from_inds(bnds, which='any')
 
             # pop the sites, contract, then re-add
-            pts = [psi._pop_tensor(tid) for tid in site_tids]
+            pts = [psi.pop_tensor(tid) for tid in site_tids]
             psi |= tensor_contract(*pts, TG)
 
             return psi

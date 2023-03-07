@@ -58,11 +58,24 @@ class TestMatrixProductState:
         assert_allclose(z3, z7)
 
     def test_from_dense(self):
-        psi = qu.rand_ket(2**8)
-        mps = MatrixProductState.from_dense(psi, dims=[2] * 8)
-        assert mps.tags == oset(f'I{i}' for i in range(8))
-        assert mps.site_inds == tuple(f'k{i}' for i in range(8))
-        assert mps.L == 8
+        L = 8
+        psi = qu.rand_ket(2**L)
+        mps = MatrixProductState.from_dense(psi, dims=[2] * L)
+        assert mps.tags == oset(f'I{i}' for i in range(L))
+        assert mps.site_inds == tuple(f'k{i}' for i in range(L))
+        assert mps.L == L
+        assert mps.bond_sizes() == [2, 4, 8, 16, 8, 4, 2]
+        mpod = mps.to_dense()
+        assert qu.expec(mpod, psi) == pytest.approx(1)
+
+    def test_from_dense_low_rank(self):
+        L = 6
+        psi = qu.ghz_state(L)
+        mps = MatrixProductState.from_dense(psi, dims=[2] * L)
+        assert mps.tags == oset(f'I{i}' for i in range(L))
+        assert mps.site_inds == tuple(f'k{i}' for i in range(L))
+        assert mps.L == L
+        assert mps.bond_sizes() == [2, 2, 2, 2, 2]
         mpod = mps.to_dense()
         assert qu.expec(mpod, psi) == pytest.approx(1)
 
@@ -304,7 +317,7 @@ class TestMatrixProductState:
 
         p2 = p.add_MPS(p, compress=True, method=method, form=form, cutoff=1e-6)
         assert max(p2['I4'].shape) == 7
-        assert_allclose(p2.H @ p, 2)
+        assert_allclose(p2.H @ p, 2, rtol=1e-5)
 
     def test_subtract(self):
         a, b, c = (MPS_rand_state(10, 7) for _ in 'abc')
@@ -538,6 +551,16 @@ class TestMatrixProductState:
         G = qu.rand_uni(4)
         p.gate_(G, (1, n - 2), contract='swap+split')
         assert p.bond_sizes() == [1] + [2] * (n - 3) + [1]
+
+    def test_flip(self):
+        p = MPS_rand_state(5, 3)
+        pf = p.flip()
+        # we want a single index per dimension, not all combined into one
+        inds = [[ix] for ix in p.site_inds]
+        assert_allclose(
+            p.to_dense(*inds),
+            pf.to_dense(*inds).transpose()
+        )
 
     def test_correlation(self):
         ghz = (MPS_computational_state('0000') +
