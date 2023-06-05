@@ -40,7 +40,7 @@ class TestPEPSConstruct:
                 assert isinstance(psi[f"I{i},{j}"], qtn.Tensor)
 
         if Lx == Ly == 3:
-            psi_dense = psi.to_dense(optimize="random-greedy")
+            psi_dense = psi.to_qarray(optimize="random-greedy")
             assert psi_dense.shape == (512, 1)
 
         psi.show()
@@ -102,7 +102,7 @@ class TestPEPSConstruct:
         D = 2
 
         psi = qtn.PEPS.rand(Lx, Ly, bond_dim=D, seed=42, dtype=complex)
-        psi_d = psi.to_dense()
+        psi_d = psi.to_qarray()
         G = qu.rand_matrix(2)
 
         # compute the exact dense reference
@@ -133,7 +133,7 @@ class TestPEPSConstruct:
         D = 2
 
         psi = qtn.PEPS.rand(Lx, Ly, bond_dim=D, seed=42, dtype=complex)
-        psi_d = psi.to_dense()
+        psi_d = psi.to_qarray()
 
         # ikron can't tensor operators across non-adjacent subsytems
         # so we explicitly construct the gate as a sum of tensor components
@@ -225,6 +225,17 @@ class Test2DContract:
         xt = norm.contract_boundary(max_bond=27, mode="full-bond")
         assert xt == pytest.approx(xe, rel=1e-2)
 
+    @pytest.mark.parametrize("dims", [(10, 4), (4, 10)])
+    def test_contract_boundary_stopping_criterion(self, dims):
+        tn = qtn.TN2D_from_fill_fn(
+            lambda shape: ar.lazy.Variable(shape=shape, backend="numpy"),
+            *dims,
+            D=2,
+        )
+        tn.contract_ctmrg_(4, cutoff=0.0, final_contract=False, progbar=True)
+        assert tn.max_bond() == 4
+        assert 16 <= tn.num_tensors <= 20
+
     @pytest.mark.parametrize("lazy", [False, True])
     def test_coarse_grain_basics(self, lazy):
         tn = qtn.TN2D_from_fill_fn(
@@ -249,7 +260,8 @@ class Test2DContract:
 
     def test_contract_hotrg(self):
         tn = qtn.TN2D_classical_ising_partition_function(16, 16, 0.44)
-        Zap = tn.contract_hotrg(max_bond=5) ^ ...
+        tn.contract_hotrg_(max_bond=5, progbar=True, equalize_norms=1.0)
+        Zap = tn.item() * 10**tn.exponent
         assert Zap == pytest.approx(8.459419593253275e100, rel=2e-3)
 
     def test_contract_hotrg_two_layer_rand_peps(self):
@@ -262,15 +274,15 @@ class Test2DContract:
         )
         norm = psi.make_norm()
         xe = norm.contract(all, optimize="auto-hq")
-        xt = norm.contract_hotrg(max_bond=5) ^ ...
+        xt = norm.contract_hotrg(max_bond=5)
         assert xt == pytest.approx(xe, rel=1e-4)
 
     def test_ising_accuracy_regression(self):
         tn = qtn.TN2D_classical_ising_partition_function(16, 16, 0.44)
-        for s in "bltr":
+        for s in [("xmin",), ("xmax",), ("ymin",), ("ymax",)]:
             Zap = tn.contract_boundary(max_bond=8, sequence=s)
             assert Zap == pytest.approx(8.459419593253275e100, rel=2.2e-7)
-        for s in ["bt", "lr"]:
+        for s in [("xmin", "xmax"), ("ymin", "ymax")]:
             Zap = tn.contract_boundary(max_bond=8, sequence=s)
             assert Zap == pytest.approx(8.459419593253275e100, rel=3.9e-9)
 
@@ -283,9 +295,9 @@ class Test2DContract:
         if mode == "mps":
             Z = tn.contract_boundary(max_bond=16)
         elif mode == "ctmrg":
-            Z = tn.contract_ctmrg(max_bond=16) ^ ...
+            Z = tn.contract_ctmrg(max_bond=16)
         elif mode == "hotrg":
-            Z = tn.contract_hotrg(max_bond=16) ^ ...
+            Z = tn.contract_hotrg(max_bond=16)
 
         assert Z == pytest.approx(Zex, rel=1e-1)
 
@@ -369,7 +381,7 @@ class Test2DContract:
         peps = qtn.PEPS.rand(4, 3, 2, seed=42, dtype="complex")
 
         # reference
-        k = peps.to_dense()
+        k = peps.to_qarray()
         if normalized:
             qu.normalize(k)
         coos = list(itertools.product([0, 2, 3], [0, 1, 2]))
@@ -394,7 +406,7 @@ class Test2DContract:
         Hij = qu.ham_heis(2, cyclic=False)
 
         peps = qtn.PEPS.rand(4, 3, 2, seed=42)
-        k = peps.to_dense()
+        k = peps.to_qarray()
 
         if normalized:
             qu.normalize(k)
@@ -458,7 +470,7 @@ class TestPEPO:
                 assert isinstance(X[f"I{i},{j}"], qtn.Tensor)
 
         if Lx == Ly == 3:
-            X_dense = X.to_dense(optimize="random-greedy")
+            X_dense = X.to_qarray(optimize="random-greedy")
             assert X_dense.shape == (512, 512)
             assert qu.isherm(X_dense)
 
@@ -479,9 +491,9 @@ class TestPEPO:
         x = qtn.PEPS.rand(Lx=3, Ly=2, bond_dim=2, seed=0)
         y = A.apply(x)
         assert y.num_indices == x.num_indices
-        Ad = A.to_dense()
-        xd = x.to_dense()
-        yd = y.to_dense()
+        Ad = A.to_qarray()
+        xd = x.to_qarray()
+        yd = y.to_qarray()
         assert_allclose(Ad @ xd, yd)
         yc = A.apply(x, compress=True, max_bond=3)
         assert yc.max_bond() == 3

@@ -541,7 +541,7 @@ class TestTensorFunctions:
     @pytest.mark.parametrize("method", ["svd", "eig"])
     def test_entropy_matches_dense(self, method):
         p = MPS_rand_state(5, 32)
-        p_dense = p.to_dense()
+        p_dense = p.to_qarray()
         real_svn = qu.entropy(p_dense.ptr([2] * 5, [0, 1, 2]))
 
         svn = (p ^ ...).entropy(("k0", "k1", "k2"))
@@ -917,9 +917,11 @@ class TestTensorNetwork:
         for tag, names in d2.tag_map.items():
             assert d.tag_map[tag] == names
 
+        assert isinstance(d >> ["red", "green", "blue"], Tensor)
+
         # test inplace
         d >>= ["red", "green", "blue"]
-        assert isinstance(d, Tensor)
+        assert isinstance(d, TensorNetwork)
 
     def test_contract_with_slices(self):
         a = rand_tensor((2, 3, 4), inds=[0, 1, 2], tags="I0")
@@ -934,6 +936,21 @@ class TestTensorNetwork:
         assert len((tn ^ slice(-1, 1)).tensors) == 3
         assert len((tn ^ slice(None, -2, -1)).tensors) == 3
         assert len((tn ^ slice(-2, 0)).tensors) == 3
+
+
+    @pytest.mark.parametrize("structured", [True, False])
+    @pytest.mark.parametrize("inplace", [True, False])
+    def test_contract_output_unwrapping(self, structured, inplace):
+        psi = qtn.MPS_rand_state(5, 3)
+        tn = psi.H & psi
+        if structured:
+            tags = ...
+        else:
+            tags = all
+
+        x = tn.contract(tags, inplace=inplace)
+
+        assert isinstance(x, TensorNetwork) == inplace
 
     def test_contraction_info(self):
         a = qtn.rand_tensor((8, 8), ("a", "b"))

@@ -16,8 +16,9 @@ from numbers import Integral
 import numpy as np
 import opt_einsum as oe
 import scipy.sparse.linalg as spla
-from autoray import (do, conj, reshape, transpose, astype,
-                     infer_backend, get_dtype_name, dag)
+from autoray import (
+    do, conj, astype, infer_backend, get_dtype_name, dag, shape
+)
 try:
     from autoray import get_common_dtype
 except ImportError:
@@ -30,7 +31,7 @@ from ..gen.rand import randn, seed_rand, rand_matrix, rand_uni
 from . import decomp
 from .array_ops import (iscomplex, norm_fro, ndim, asarray, PArray,
                         find_diag_axes, find_antidiag_axes, find_columns)
-from .drawing import draw_tn, visualize_tensor
+from .drawing import draw_tn, visualize_tensor, auto_color_html
 
 from .contraction import (
     get_contractor,
@@ -128,6 +129,15 @@ def _inds_to_eq(inputs, output):
 _VALID_CONTRACT_GET = {None, 'expression', 'path', 'path-info', 'symbol-map'}
 
 
+def maybe_realify_scalar(data):
+    """If ``data`` is a numpy array, check if its complex with small imaginary
+    part, and if so return only the real part, otherwise do nothing.
+    """
+    if isinstance(data, np.ndarray):
+        data = realify_scalar(data.item())
+    return data
+
+
 def tensor_contract(
     *tensors,
     output_inds=None,
@@ -135,6 +145,7 @@ def tensor_contract(
     get=None,
     backend=None,
     preserve_tensor=False,
+    drop_tags=False,
     **contract_opts
 ):
     """Contract a collection of tensors into a scalar or tensor, automatically
@@ -186,6 +197,9 @@ def tensor_contract(
     preserve_tensor : bool, optional
         Whether to return a tensor regardless of whether the output object
         is a scalar (has no indices) or not.
+    drop_tags : bool, optional
+        Whether to drop all tags from the output tensor. By default the output
+        tensor will keep the union of all tags from the input tensors.
     contract_opts
         Passed to ``opt_einsum.contract_expression`` or
         ``opt_einsum.contract_path``.
@@ -243,12 +257,13 @@ def tensor_contract(
     data_out = expression(*arrays, backend=backend)
 
     if not inds_out and not preserve_tensor:
-        if isinstance(data_out, np.ndarray):
-            data_out = realify_scalar(data_out.item())
-        return data_out
+        return maybe_realify_scalar(data_out)
 
-    # union of all tags
-    tags_out = oset_union(t.tags for t in tensors)
+    if drop_tags:
+        tags_out = None
+    else:
+        # union of all tags
+        tags_out = oset_union(t.tags for t in tensors)
 
     return Tensor(data=data_out, inds=inds_out, tags=tags_out)
 
@@ -1087,20 +1102,58 @@ def get_tags(ts):
     return oset_union(t.tags for t in ts)
 
 
-def maybe_unwrap(t, preserve_tensor=False, equalize_norms=False):
+def maybe_unwrap(
+    t,
+    preserve_tensor_network=False,
+    preserve_tensor=False,
+    equalize_norms=False,
+    output_inds=None,
+):
     """Maybe unwrap a ``TensorNetwork`` or ``Tensor`` into a ``Tensor`` or
-    scalar, depending on how many tensors and indices it has.
+    scalar, depending on how many tensors and indices it has, optionally
+    handling accrued exponent normalization and output index ordering (if a
+    tensor).
+
+    Parameters
+    ----------
+    t : Tensor or TensorNetwork
+        The tensor or tensor network to unwrap.
+    preserve_tensor_network : bool, optional
+        If ``True``, then don't unwrap a ``TensorNetwork`` to a ``Tensor`` even
+        if it has only one tensor.
+    preserve_tensor : bool, optional
+        If ``True``, then don't unwrap a ``Tensor`` to a scalar even if it has
+        no indices.
+    equalize_norms : bool, optional
+        If ``True``, then equalize the norms of all tensors in the tensor
+        network before unwrapping.
+    output_inds : sequence of str, optional
+        If unwrapping a tensor, then transpose it to the specified indices.
+
+    Returns
+    -------
+    TensorNetwork, Tensor or Number
     """
     if isinstance(t, TensorNetwork):
         if equalize_norms is True:
             # this also redistributes the any collected norm exponent
             t.equalize_norms_()
-        if t.num_tensors != 1:
+
+        if preserve_tensor_network or (t.num_tensors != 1):
             return t
+
+        # else get the single tensor
         t, = t.tensor_map.values()
+
+    if output_inds is not None and t.inds != output_inds:
+        t.transpose_(*output_inds)
+
     if preserve_tensor or t.ndim != 0:
+        # return as a tensor
         return t
-    return t.data
+
+    # else return as a scalar, maybe dropping imaginary part
+    return maybe_realify_scalar(t.data)
 
 
 def tensor_network_distance(
@@ -1152,10 +1205,15 @@ def tensor_network_distance(
     """
     check_opt('method', method, ('auto', 'dense', 'overlap'))
 
+    tnA = tnA.as_network()
+    tnB = tnB.as_network()
+
     oix = tnA.outer_inds()
     if set(oix) != set(tnB.outer_inds()):
         raise ValueError(
-            "Can only fit tensor networks with matching outer indices.")
+            "Can only compute distance between tensor "
+            "networks with matching outer indices."
+        )
 
     if method == 'auto':
         d = tnA.inds_size(oix)
@@ -1166,8 +1224,8 @@ def tensor_network_distance(
 
     # directly form vectorizations of both
     if method == 'dense':
-        A = tnA.to_dense(oix, to_qarray=False)
-        B = tnB.to_dense(oix, to_qarray=False)
+        A = tnA.to_dense(oix)
+        B = tnB.to_dense(oix)
         return do('linalg.norm', A - B)
 
     # overlap method
@@ -1239,7 +1297,8 @@ def tensor_network_fit_autodiff(
         loss_kwargs={'method': distance_method, 'optimize': contract_optimize},
         autodiff_backend=autodiff_backend,
         progbar=progbar,
-        **kwargs)
+        **kwargs
+    )
 
     tn_fit = tnopt.optimize(steps, tol=tol)
 
@@ -1464,7 +1523,7 @@ def tensor_network_fit_als(
 #                                Tensor Class                                 #
 # --------------------------------------------------------------------------- #
 
-class Tensor(object):
+class Tensor:
     """A labelled, tagged n-dimensional array. The index labels are used
     instead of axis numbers to identify dimensions, and are preserved through
     operations. The tags are used to identify the tensor within networks, and
@@ -1511,18 +1570,18 @@ class Tensor(object):
 
         # short circuit for copying / casting Tensor instances
         if isinstance(data, Tensor):
-            self._data = data.data
-            self._inds = data.inds
-            self._tags = data.tags.copy()
-            self._left_inds = data.left_inds
+            self._set_data(data.data)
+            self._set_inds(data.inds)
+            self._set_tags(data.tags)
+            self._set_left_inds(data.left_inds)
             return
 
-        self._data = asarray(data)
-        self._inds = tuple(inds)
-        self._tags = tags_to_oset(tags)
-        self._left_inds = tuple(left_inds) if left_inds is not None else None
+        self._set_data(data)
+        self._set_inds(inds)
+        self._set_tags(tags)
+        self._set_left_inds(left_inds)
 
-        if ndim(self._data) != len(self.inds):
+        if ndim(self._data) != len(self._inds):
             raise ValueError(
                 f"Wrong number of inds, {self.inds}, supplied for array"
                 f" of shape {self._data.shape}."
@@ -1532,6 +1591,21 @@ class Tensor(object):
                 f"The 'left' indices {self.left_inds} are not "
                 f"found in {self.inds}."
             )
+
+    def _set_data(self, data):
+        self._data = asarray(data)
+
+    def _set_inds(self, inds):
+        self._inds = tuple(inds)
+
+    def _set_tags(self, tags):
+        self._tags = tags_to_oset(tags)
+
+    def _set_left_inds(self, left_inds):
+        if left_inds is None:
+            self._left_inds = None
+        else:
+            self._left_inds = tuple(left_inds)
 
     def get_params(self):
         """A simple function that returns the 'parameters' of the underlying
@@ -1561,7 +1635,7 @@ class Tensor(object):
         elif hasattr(self.data, "params"):
             self.data.params = params
         else:
-            self._data = params
+            self._set_data(params)
 
     def copy(self, deep=False, virtual=False):
         """Copy this tensor.
@@ -1643,7 +1717,7 @@ class Tensor(object):
         return len(self._owners) > 0
 
     def _apply_function(self, fn):
-        self._data = fn(self.data)
+        self._set_data(fn(self.data))
 
     def modify(self, **kwargs):
         """Overwrite the data of this tensor in place.
@@ -1663,7 +1737,7 @@ class Tensor(object):
             New grouping of indices to be 'on the left'.
         """
         if 'data' in kwargs:
-            self._data = asarray(kwargs.pop('data'))
+            self._set_data(kwargs.pop('data'))
             self._left_inds = None
 
         if 'apply' in kwargs:
@@ -1861,21 +1935,35 @@ class Tensor(object):
 
     @property
     def shape(self):
-        return self._data.shape
+        """The size of each dimension.
+        """
+        return shape(self._data)
 
     @property
     def ndim(self):
+        """The number of dimensions.
+        """
         return len(self._inds)
 
     @property
     def size(self):
+        """The total number of array elements.
+        """
         # more robust than calling _data.size (e.g. for torch) - consider
         # adding do('size', x) to autoray?
         return prod(self.shape)
 
     @property
     def dtype(self):
-        return self._data.dtype
+        """The data type of the array elements.
+        """
+        return getattr(self._data, "dtype", None)
+
+    @property
+    def backend(self):
+        """The backend inferred from the data.
+        """
+        return infer_backend(self._data)
 
     def iscomplex(self):
         return iscomplex(self.data)
@@ -1958,7 +2046,7 @@ class Tensor(object):
 
         current_ind_map = {ind: i for i, ind in enumerate(t.inds)}
         perm = tuple(current_ind_map[i] for i in output_inds)
-        t.modify(apply=lambda x: transpose(x, perm), inds=output_inds)
+        t.modify(apply=lambda x: do("transpose", x, perm), inds=output_inds)
         return t
 
     transpose_ = functools.partialmethod(transpose, inplace=True)
@@ -2164,11 +2252,52 @@ class Tensor(object):
     def split(self, *args, **kwargs):
         return tensor_split(self, *args, **kwargs)
 
+    def compute_reduced_factor(
+        self,
+        side,
+        left_inds,
+        right_inds,
+        **split_opts,
+    ):
+        check_opt("side", side, ("left", "right"))
+
+        split_opts["left_inds"] = left_inds
+        split_opts["right_inds"] = right_inds
+        split_opts["get"] = "arrays"
+        if side == "right":
+            which = 1
+            split_opts["method"] = "qr"
+        else:  # side == "left"
+            which = 0
+            split_opts["method"] = "lq"
+
+        return tensor_split(self, **split_opts)[which]
+
+        X = self.to_dense(left_inds, right_inds)
+
+        if side == "right":
+            # contract the left indices
+            XX = dag(X) @ X
+        else: # "left"
+            # contract the right indices
+            XX = X @ dag(X)
+
+        return decomp.squared_op_to_reduced_factor(
+            XX, *shape(X), right=(side == "right")
+        )
+
+
     @functools.wraps(tensor_network_distance)
     def distance(self, other, **contract_opts):
         return tensor_network_distance(self, other, **contract_opts)
 
-    def gate(self, G, ind, inplace=False, **contract_opts):
+    def gate(
+        self,
+        G,
+        ind,
+        preserve_inds=True,
+        inplace=False,
+    ):
         """Gate this tensor - contract a matrix into one of its indices without
         changing its indices. Unlike ``contract``, ``G`` is a raw array and the
         tensor remains with the same set of indices.
@@ -2206,10 +2335,20 @@ class Tensor(object):
 
         """
         t = self if inplace else self.copy()
-        G_inds = ['__tmp__', ind]
-        out = ['__tmp__' if ix == ind else ix for ix in t.inds]
-        new_data = oe.contract(G, G_inds, t.data, t.inds, out, **contract_opts)
-        t.modify(data=new_data)
+
+        ax = t.inds.index(ind)
+        new_data = do("tensordot", G, t.data, ((1,), (ax,)))
+
+        if preserve_inds:
+            # gated index is now first axis, so move it to the correct position
+            perm = (*range(1, ax + 1), 0, *range(ax + 1, t.ndim))
+            new_data = do("transpose", new_data, perm)
+            t.modify(data=new_data)
+        else:
+            # simply update index labels
+            new_inds = (ind, *t.inds[:ax], *t.inds[ax + 1:])
+            t.modify(data=new_data, inds=new_inds)
+
         return t
 
     gate_ = functools.partialmethod(gate, inplace=True)
@@ -2398,23 +2537,25 @@ class Tensor(object):
         # create new tensor with new + remaining indices
         #     + updated 'left' marked indices assuming all unfused left inds
         #       remain 'left' marked
-        t.modify(data=reshape(t.data, new_dims),
+        t.modify(data=do("reshape", t.data, new_dims),
                  inds=new_inds, left_inds=new_left_inds)
 
         return t
 
     unfuse_ = functools.partialmethod(unfuse, inplace=True)
 
-    def to_dense(self, *inds_seq, to_qarray=True):
+    def to_dense(self, *inds_seq, to_qarray=False):
         """Convert this Tensor into an dense array, with a single dimension
         for each of inds in ``inds_seqs``. E.g. to convert several sites
         into a density matrix: ``T.to_dense(('k0', 'k1'), ('b0', 'b1'))``.
         """
         fuse_map = [(f"__d{i}__", ix) for i, ix in enumerate(inds_seq)]
         x = self.fuse(fuse_map).data
-        if (infer_backend(x) == 'numpy') and to_qarray:
+        if to_qarray and (infer_backend(x) == 'numpy'):
             return qarray(x)
         return x
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     def squeeze(self, include=None, inplace=False):
         """Drop any singlet dimensions from this tensor.
@@ -2444,10 +2585,10 @@ class Tensor(object):
         if not new_shape_new_inds:
             # squeezing everything -> can't unzip `new_shape_new_inds`
             new_inds = ()
-            new_data = reshape(t.data, ())
+            new_data = do("reshape", t.data, ())
         else:
             new_shape, new_inds = zip(*new_shape_new_inds)
-            new_data = reshape(t.data, new_shape)
+            new_data = do("reshape", t.data, new_shape)
 
         new_left_inds = (
             None if self.left_inds is None else
@@ -2568,7 +2709,7 @@ class Tensor(object):
         x = decomp.isometrize(x, method=method)
 
         # turn the array back into a tensor
-        x = reshape(x, [self.ind_size(ix) for ix in LR_inds])
+        x = do("reshape", x, [self.ind_size(ix) for ix in LR_inds])
         Tu = self.__class__(
             x, inds=LR_inds, tags=self.tags, left_inds=left_inds
         )
@@ -2632,7 +2773,9 @@ class Tensor(object):
         tensor being contracted into index ``ind``.
         """
         t = self if inplace else self.copy()
-        x_broadcast = reshape(x, [(-1 if i == ind else 1) for i in t.inds])
+        x_broadcast = do(
+            "reshape", x, tuple((-1 if i == ind else 1) for i in t.inds)
+        )
         t.modify(data=t.data * x_broadcast)
         return t
 
@@ -2752,17 +2895,75 @@ class Tensor(object):
         self._tags = tags.copy()
         self._owners = {}
 
-    def __repr__(self):
-        return (f"{self.__class__.__name__}("
-                f"shape={tuple(map(int, self.data.shape))}, "
-                f"inds={self.inds}, "
-                f"tags={self.tags})")
+    def _repr_info(self):
+        """General info to show in various reprs. Sublasses can add more
+        relevant info to this dict.
+        """
+        info = {
+            "shape": self.shape,
+            "inds": self.inds,
+            "tags": self.tags,
+        }
+        if self._left_inds is not None:
+            info["left_inds"] = self._left_inds
+        return info
+
+    def _repr_info_extra(self):
+        """General detailed info to show in various reprs. Sublasses can add
+        more relevant info to this dict.
+        """
+        return {
+            "backend": self.backend,
+            "dtype": get_dtype_name(self.data),
+        }
+
+    def _repr_info_str(self, normal=True, extra=False):
+        """Render the general info as a string.
+        """
+        info = {}
+        if normal:
+            info.update(self._repr_info())
+        if extra:
+            info.update(self._repr_info_extra())
+        return ", ".join(
+            "{}={}".format(k, f"'{v}'" if isinstance(v, str) else v)
+            for k, v in info.items()
+        )
+
+    def _repr_html_(self):
+        """Render this Tensor as HTML, for Jupyter notebooks.
+        """
+        s = "<samp>"
+        s += "<details>"
+        s += "<summary>"
+        shape_repr = ', '.join(auto_color_html(d) for d in self.shape)
+        inds_repr = ', '.join(auto_color_html(ix) for ix in self.inds)
+        tags_repr = ', '.join(auto_color_html(tag) for tag in self.tags)
+        s += (
+            f"{auto_color_html(self.__class__.__name__)}("
+            f'shape=({shape_repr}), inds=[{inds_repr}], tags={{{tags_repr}}}'
+            "),"
+        )
+        s += "</summary>"
+        s += f"backend={auto_color_html(self.backend)}, "
+        s += f"dtype={auto_color_html(self.dtype)}, "
+        if self.size > 100:
+            s += "data=..."
+        else:
+            s += f"data={repr(self.data)}"
+        s += "</details>"
+        s += "</samp>"
+        return s
 
     def __str__(self):
-        s = self.__repr__()[:-1]
-        s += (f", backend='{infer_backend(self.data)}'"
-              f", dtype='{get_dtype_name(self.data)}')")
-        return s
+        return (
+            f"{self.__class__.__name__}({self._repr_info_str(extra=True)})"
+        )
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}({self._repr_info_str()})"
+        )
 
 
 @functools.lru_cache(128)
@@ -3281,7 +3482,7 @@ def tensor_network_gate_inds(
 
     if ndimG != 2 * ng:
         # gate supplied as matrix, factorize it
-        G = reshape(G, dims * 2)
+        G = do("reshape", G, dims * 2)
 
     if not all(d == dims[i % ng] for i, d in enumerate(G.shape)):
         raise ValueError(f"Gate with shape {G.shape} doesn't match "
@@ -3390,17 +3591,43 @@ class TensorNetwork(object):
         for t in ts:
             self.add(t, virtual=virtual, check_collisions=check_collisions)
 
+    def combine(self, other, *, virtual=False, check_collisions=True):
+        """Combine this tensor network with another, returning a new tensor
+        network.
+
+        Parameters
+        ----------
+        other : TensorNetwork
+            The other tensor network to combine with.
+        virtual : bool, optional
+            Whether the new tensor network should copy all the incoming tensors
+            (``False``, the default), or view them as virtual (``True``).
+        check_collisions : bool, optional
+            Whether to check for index collisions between the two tensor
+            networks before combining them. If ``True`` (the default), any
+            inner indices that clash will be mangled.
+
+        Returns
+        -------
+        TensorNetwork
+        """
+        return TensorNetwork(
+            (self, other),
+            virtual=virtual,
+            check_collisions=check_collisions,
+        )
+
     def __and__(self, other):
         """Combine this tensor network with more tensors, without contracting.
         Copies the tensors.
         """
-        return TensorNetwork((self, other))
+        return self.combine(other, virtual=False, check_collisions=True)
 
     def __or__(self, other):
         """Combine this tensor network with more tensors, without contracting.
         Views the constituent tensors.
         """
-        return TensorNetwork((self, other), virtual=True)
+        return self.combine(other, virtual=True, check_collisions=True)
 
     @classmethod
     def from_TN(cls, tn, like=None, inplace=False, **kwargs):
@@ -4554,10 +4781,6 @@ class TensorNetwork(object):
         """
         tagged_tids = self._get_tids_from_tags(tags, which=which)
 
-        # check if all tensors have been tagged
-        if len(tagged_tids) == self.num_tensors:
-            return None, self.tensor_map.values()
-
         # Copy untagged to new network, and pop tagged tensors from this
         untagged_tn = self if inplace else self.copy()
         tagged_ts = tuple(map(untagged_tn.pop_tensor, sorted(tagged_tids)))
@@ -4957,6 +5180,106 @@ class TensorNetwork(object):
         gate_inds_with_tn, inplace=True
     )
 
+    def _compute_tree_gauges(self, tree, outputs):
+        """Given a ``tree`` of connected tensors, absorb the gauges from
+        outside inwards, finally outputing the gauges associated with the
+        ``outputs``.
+
+        Parameters
+        ----------
+        tree : sequence of (tid_outer, tid_inner, distance)
+            The tree of connected tensors, see :meth:`get_tree_span`.
+        outputs : sequence of (tid, ind)
+            Each output is specified by a tensor id and an index, such that
+            having absorbed all gauges in the tree, the effective reduced
+            factor of the tensor with respect to the index is returned.
+
+        Returns
+        -------
+        Gouts : sequence of array
+            The effective reduced factors of the tensor index pairs specified
+            in ``outputs``, each a matrix.
+        """
+        Gs = {}
+
+        for tid_outer, tid_inner, _ in tree:
+            t_outer = self.tensor_map[tid_outer]
+            t_inner = self.tensor_map[tid_inner]
+
+            # group indices and ensure single connecting bond
+            outer_ix, inner_ix, _ = tensor_make_single_bond(
+                t_outer,
+                t_inner,
+            )
+
+            # absorb any present gauges into the outer tensor
+            for ix in outer_ix:
+                if ix in Gs:
+                    t_outer = t_outer.gate(Gs.pop(ix), ix)
+
+            # compute the reduced factor to accumulated inwards
+            new_G = t_outer.compute_reduced_factor('right', outer_ix, inner_ix)
+
+            # store the normalized gauge associated with the tree bond
+            Gs[inner_ix] = new_G / do("linalg.norm", new_G)
+
+        # compute the final output gauges
+        Gouts = []
+        for tid, ind in outputs:
+            t_outer = self.tensor_map[tid]
+
+            # absorb any present gauges into the output tensor
+            outer_ix = tuple(ix for ix in t_outer.inds if ix != ind)
+            for ix in outer_ix:
+                if ix in Gs:
+                    t_outer = t_outer.gate(Gs.pop(ix), ix)
+
+            # compute the final reduced factor
+            Gout = t_outer.compute_reduced_factor('right', outer_ix, ind)
+            Gouts.append(Gout)
+
+        return Gouts
+
+    def _compress_between_virtual_tree_tids(
+        self,
+        tidl,
+        tidr,
+        max_bond,
+        cutoff,
+        r,
+        absorb="both",
+        include=None,
+        exclude=None,
+        span_opts=None,
+        **compress_opts,
+    ):
+        check_opt("absorb", absorb, ("both",))
+
+        span_opts = ensure_dict(span_opts)
+        span_opts["max_distance"] = r
+        span_opts["include"] = include
+        span_opts["exclude"] = exclude
+
+        compress_opts["max_bond"] = max_bond
+        compress_opts["cutoff"] = cutoff
+
+        tl = self.tensor_map[tidl]
+        tr = self.tensor_map[tidr]
+        _, bix, _ = tensor_make_single_bond(tl, tr)
+
+        # build a single tree spanning out from both tensors
+        tree = self.get_tree_span([tidl, tidr], **span_opts)
+
+        # compute the output gauges associated with the tree
+        Rl, Rr = self._compute_tree_gauges(tree, [(tidl, bix), (tidr, bix)])
+
+        # compute the oblique projectors from the reduced factors
+        Pl, Pr = decomp.compute_oblique_projectors(Rl, Rr.T, **compress_opts)
+
+        # absorb the projectors into the tensors to perform the compression
+        tl.gate_(Pl.T, bix)
+        tr.gate_(Pr, bix)
+
     def _compute_bond_env(
         self, tid1, tid2,
         select_local_distance=None,
@@ -5148,27 +5471,53 @@ class TensorNetwork(object):
             return
 
         if (max_bond is not None) and (cutoff == 0.0):
-            lsize = prod(map(self.ind_size, lix))
-            rsize = prod(map(self.ind_size, rix))
+            lsize = self.inds_size(lix)
+            rsize = self.inds_size(rix)
             if (lsize <= max_bond) or (rsize <= max_bond):
                 # special case - fixing any orthonormal basis for the left or
                 # right tensor (whichever has smallest outer dimensions) will
                 # produce the required compression without any SVD
                 compress_absorb = 'right' if lsize <= rsize else 'left'
                 tensor_canonize_bond(
-                    ta, tb, absorb=compress_absorb,
-                    gauges=gauges, gauge_smudge=gauge_smudge)
+                    ta, tb,
+                    absorb=compress_absorb,
+                    gauges=gauges,
+                    gauge_smudge=gauge_smudge,
+                )
 
                 if absorb != compress_absorb:
                     tensor_canonize_bond(
-                        ta, tb, absorb=absorb,
-                        gauges=gauges, gauge_smudge=gauge_smudge)
+                        ta, tb,
+                        absorb=absorb,
+                        gauges=gauges,
+                        gauge_smudge=gauge_smudge,
+                    )
 
                 if equalize_norms:
                     self.strip_exponent(tid1, equalize_norms)
                     self.strip_exponent(tid2, equalize_norms)
 
                 return
+
+        compress_opts['max_bond'] = max_bond
+        compress_opts['cutoff'] = cutoff
+        compress_opts['absorb'] = absorb
+        if gauges is not None:
+            compress_opts['gauges'] = gauges
+            compress_opts['gauge_smudge'] = gauge_smudge
+
+        if isinstance(mode, str) and "virtual" in mode:
+            # canonize distance is handled by the virtual tree
+            # -> turn off explicit tree canonization
+            compress_opts.setdefault("r", canonize_distance)
+            if canonize_opts is not None:
+                compress_opts.setdefault(
+                    "include", canonize_opts.get("include", None)
+                )
+                compress_opts.setdefault(
+                    "exclude", canonize_opts.get("exclude", None)
+                )
+            canonize_distance = None
 
         if canonize_distance:
             # gauge around pair by absorbing QR factors along bonds
@@ -5182,26 +5531,27 @@ class TensorNetwork(object):
                 **canonize_opts
             )
 
-        compress_opts['max_bond'] = max_bond
-        compress_opts['cutoff'] = cutoff
-        compress_opts['absorb'] = absorb
-        if gauges is not None:
-            compress_opts['gauges'] = gauges
-            compress_opts['gauge_smudge'] = gauge_smudge
-
         if mode == 'basic':
-            tensor_compress_bond(ta, tb, **compress_opts)
-
+            tensor_compress_bond(
+                ta, tb, **compress_opts
+            )
+        elif mode == 'virtual-tree':
+            self._compress_between_virtual_tree_tids(
+                tid1, tid2, **compress_opts
+            )
         elif mode == 'full-bond':
-            self._compress_between_full_bond_tids(tid1, tid2, **compress_opts)
-
-
+            self._compress_between_full_bond_tids(
+                tid1, tid2, **compress_opts
+            )
         elif mode == 'local-fit':
-            self._compress_between_local_fit(tid1, tid2, **compress_opts)
-
+            self._compress_between_local_fit(
+                tid1, tid2, **compress_opts
+            )
         else:
             # assume callable
-            mode(self, tid1, tid2, **compress_opts)
+            mode(
+                self, tid1, tid2, **compress_opts
+            )
 
         if equalize_norms:
             self.strip_exponent(tid1, equalize_norms)
@@ -5337,7 +5687,7 @@ class TensorNetwork(object):
         self,
         max_bond,
         gauges=None,
-        max_iterations=10,
+        max_iterations=5,
         tol=0.0,
         smudge=1e-12,
         power=1.0,
@@ -5447,7 +5797,15 @@ class TensorNetwork(object):
         tid2, = self._get_tids_from_tags(tags2, which='all')
         self._canonize_between_tids(tid1, tid2, absorb=absorb, **canonize_opts)
 
-    def reduce_inds_onto_bond(self, inda, indb, tags=None, drop_tags=False):
+    def reduce_inds_onto_bond(
+        self,
+        inda,
+        indb,
+        tags=None,
+        drop_tags=False,
+        combine=True,
+        ndim_cutoff=3,
+    ):
         """Use QR factorization to 'pull' the indices ``inda`` and ``indb`` off
         of their respective tensors and onto the bond between them. This is an
         inplace operation.
@@ -5457,7 +5815,7 @@ class TensorNetwork(object):
         ta, tb = self._tids_get(tida, tidb)
         bix = bonds(ta, tb)
 
-        if ta.ndim > 3:
+        if ta.ndim > ndim_cutoff:
             self._split_tensor_tid(
                 tida, left_inds=None, right_inds=[inda, *bix], method='qr')
             # get new location of ind
@@ -5465,7 +5823,7 @@ class TensorNetwork(object):
         else:
             drop_tags = False
 
-        if tb.ndim > 3:
+        if tb.ndim > ndim_cutoff:
             self._split_tensor_tid(
                 tidb, left_inds=None, right_inds=[indb, *bix], method='qr')
             # get new location of ind
@@ -5474,15 +5832,26 @@ class TensorNetwork(object):
             drop_tags = False
 
         # contract the reduced factors and get the tensor
-        self._contract_between_tids(tida, tidb)
-        tab, = self._inds_get(inda, indb)
-
-        # modify with the desired tags
         tags = tags_to_oset(tags)
-        if drop_tags:
-            tab.modify(tags=tags)
+        if combine:
+            self._contract_between_tids(tida, tidb)
+            tab, = self._inds_get(inda, indb)
+
+            # modify with the desired tags
+            if drop_tags:
+                tab.modify(tags=tags)
+            else:
+                tab.modify(tags=tab.tags | tags)
+
         else:
-            tab.modify(tags=tab.tags | tags)
+            ta, = self._inds_get(inda)
+            tb, = self._inds_get(indb)
+            if drop_tags:
+                ta.modify(tags=tags)
+                tb.modify(tags=tags)
+            else:
+                ta.modify(tags=ta.tags | tags)
+                tb.modify(tags=tb.tags | tags)
 
     def _get_neighbor_tids(self, tids, exclude_inds=()):
         """Get the tids of tensors connected to the tensor at ``tid``.
@@ -6446,6 +6815,7 @@ class TensorNetwork(object):
         seq,
         max_bond=None,
         cutoff=1e-10,
+        output_inds=None,
         tree_gauge_distance=1,
         canonize_distance=None,
         canonize_opts=None,
@@ -6468,7 +6838,10 @@ class TensorNetwork(object):
         callback=None,
         preserve_tensor=False,
         progbar=False,
+        inplace=False,
     ):
+        tn = self if inplace else self.copy()
+
         if canonize_distance is None:
             canonize_distance = tree_gauge_distance
         if canonize_after_distance is None:
@@ -6481,14 +6854,14 @@ class TensorNetwork(object):
         if gauges is True:
             gauges = {}
             if gauge_boundary_only:
-                data_like = next(iter(self.tensor_map.values())).data
+                data_like = next(iter(tn.tensor_map.values())).data
                 gauges = {
-                    ix: do("ones", (self.ind_size(ix),),
+                    ix: do("ones", (tn.ind_size(ix),),
                            dtype=data_like.dtype, like=data_like)
-                    for ix in self.inner_inds()
+                    for ix in tn.inner_inds()
                 }
             else:
-                self.gauge_all_simple_(
+                tn.gauge_all_simple_(
                     gauges=gauges, equalize_norms=equalize_norms
                 )
 
@@ -6500,10 +6873,10 @@ class TensorNetwork(object):
             ``tid1`` and ``tid2``.
             """
             if callback_pre_contract is not None:
-                callback_pre_contract(self, (tid1, tid2))
+                callback_pre_contract(tn, (tid1, tid2))
 
             # new tensor is now at ``tid2``
-            self._contract_between_tids(
+            tn._contract_between_tids(
                 tid1, tid2, equalize_norms=equalize_norms, gauges=gauges,
             )
 
@@ -6511,9 +6884,9 @@ class TensorNetwork(object):
             boundary.add(tid2)
 
             if callback_post_contract is not None:
-                callback_post_contract(self, tid2)
+                callback_post_contract(tn, tid2)
 
-            return tid2, self.tensor_map[tid2]
+            return tid2, tn.tensor_map[tid2]
 
         # keep track of pairs along the tree - often no point compressing these
         #     (potentially, on some complex graphs, one needs to compress)
@@ -6542,14 +6915,14 @@ class TensorNetwork(object):
 
             if (
                 (not compress_matrices) and
-                (len(self._get_neighbor_tids([tid1])) <= 2) and
-                (len(self._get_neighbor_tids([tid1])) <= 2)
+                (len(tn._get_neighbor_tids([tid1])) <= 2) and
+                (len(tn._get_neighbor_tids([tid1])) <= 2)
             ):
                 # both are effectively matrices
                 return True
 
             if compress_min_size is not None:
-                t1, t2 = self._tids_get(tid1, tid2)
+                t1, t2 = tn._tids_get(tid1, tid2)
                 new_size = t1.size * t2.size
                 for ind in t1.bonds(t2):
                     new_size //= t1.ind_size(ind)
@@ -6602,10 +6975,10 @@ class TensorNetwork(object):
                 # skip compression
                 return
 
-            for tid_neighb in self._get_neighbor_tids(tid):
+            for tid_neighb in tn._get_neighbor_tids(tid):
 
                 # first just check for accumulation of small multi-bonds
-                t_neighb = self.tensor_map[tid_neighb]
+                t_neighb = tn.tensor_map[tid_neighb]
                 tensor_fuse_squeeze(t, t_neighb, gauges=gauges)
 
                 if _should_skip_compression(tid, tid_neighb):
@@ -6614,9 +6987,9 @@ class TensorNetwork(object):
                 # check for compressing large shared (multi) bonds
                 if (chi is None) or bonds_size(t, t_neighb) > chi:
                     if callback_pre_compress is not None:
-                        callback_pre_compress(self, (tid, tid_neighb))
+                        callback_pre_compress(tn, (tid, tid_neighb))
 
-                    self._compress_between_tids(
+                    tn._compress_between_tids(
                         tid,
                         tid_neighb,
                         max_bond=chi,
@@ -6632,7 +7005,7 @@ class TensorNetwork(object):
                     )
 
                     if callback_post_compress is not None:
-                        callback_post_compress(self, (tid, tid_neighb))
+                        callback_post_compress(tn, (tid, tid_neighb))
 
         num_contractions = len(seq)
 
@@ -6661,7 +7034,7 @@ class TensorNetwork(object):
 
             if compress_late:
                 # we compress just before we have to contract involved tensors
-                t1, t2 = self._tids_get(tid1, tid2)
+                t1, t2 = tn._tids_get(tid1, tid2)
                 _compress_neighbors(tid1, t1, d)
                 _compress_neighbors(tid2, t2, d)
 
@@ -6679,18 +7052,20 @@ class TensorNetwork(object):
                 _compress_neighbors(tid_new, t_new, d)
 
             if callback is not None:
-                callback(self, tid_new)
+                callback(tn, tid_new)
 
         if progbar:
             pbar.close()
 
         if gauges:
-            self.gauge_simple_insert(gauges, remove=True)
+            tn.gauge_simple_insert(gauges, remove=True)
 
         return maybe_unwrap(
-            self,
+            tn,
+            preserve_tensor_network=inplace,
             preserve_tensor=preserve_tensor,
             equalize_norms=equalize_norms,
+            output_inds=output_inds,
         )
 
     def _contract_around_tids(
@@ -6703,18 +7078,15 @@ class TensorNetwork(object):
         max_bond=None,
         cutoff=1e-10,
         canonize_opts=None,
-        inplace=True,
         **kwargs,
     ):
         """Contract around ``tids``, by following a greedily generated
         spanning tree, and compressing whenever two tensors in the outer
         'boundary' share more than one index.
         """
-        tn = self if inplace else self.copy()
-
         if seq is None:
             span_opts = ensure_dict(span_opts)
-            seq = tn.get_tree_span(
+            seq = self.get_tree_span(
                 tids,
                 min_distance=min_distance,
                 max_distance=max_distance,
@@ -6725,12 +7097,13 @@ class TensorNetwork(object):
             canonize_opts.get('exclude', ()), tids
         ))
 
-        return tn._contract_compressed_tid_sequence(
+        return self._contract_compressed_tid_sequence(
             seq,
             max_bond=max_bond,
             cutoff=cutoff,
             compress_exclude=tids,
-            **kwargs)
+            **kwargs
+        )
 
     def compute_centralities(self):
         import cotengra as ctg
@@ -6856,15 +7229,12 @@ class TensorNetwork(object):
         callback_post_compress=None,
         callback=None,
         progbar=False,
-        inplace=False,
         **kwargs
     ):
-        tn = self if inplace else self.copy()
-
-        path = tn.contraction_path(optimize, output_inds=output_inds)
+        path = self.contraction_path(optimize, output_inds=output_inds)
 
         # generate the list of merges (tid1 -> tid2)
-        tids = list(tn.tensor_map)
+        tids = list(self.tensor_map)
         seq = []
         for i, j in path:
             if i > j:
@@ -6876,10 +7246,11 @@ class TensorNetwork(object):
 
             seq.append((tid1, tid2))
 
-        t = tn._contract_compressed_tid_sequence(
+        return self._contract_compressed_tid_sequence(
             seq=seq,
             max_bond=max_bond,
             cutoff=cutoff,
+            output_inds=output_inds,
             tree_gauge_distance=tree_gauge_distance,
             canonize_distance=canonize_distance,
             canonize_opts=canonize_opts,
@@ -6903,12 +7274,6 @@ class TensorNetwork(object):
             progbar=progbar,
             **kwargs
         )
-
-        if output_inds and t.inds != output_inds:
-            # ensure output ordering of indices
-            t.transpose_(*output_inds)
-
-        return t
 
     contract_compressed_ = functools.partialmethod(
         contract_compressed, inplace=True)
@@ -7121,7 +7486,7 @@ class TensorNetwork(object):
         backend=None,
         preserve_tensor=False,
         inplace=False,
-        **opts
+        **contract_opts
     ):
         """Contract the tensors that match any or all of ``tags``.
 
@@ -7172,7 +7537,7 @@ class TensorNetwork(object):
             is a scalar (has no indices) or not.
         inplace : bool, optional
             Whether to perform the contraction inplace.
-        opts
+        contract_opts
             Passed to :func:`~quimb.tensor.tensor_core.tensor_contract`.
 
         Returns
@@ -7186,20 +7551,35 @@ class TensorNetwork(object):
         contract, contract_cumulative
         """
         untagged_tn, tagged_ts = self.partition_tensors(
-            tags, inplace=inplace, which=which)
-
-        contracting_all = untagged_tn is None
-        if not tagged_ts:
-            raise ValueError("No tags were found - nothing to contract. "
-                             "(Change this to a no-op maybe?)")
-
-        contracted = tensor_contract(
-            *tagged_ts, output_inds=output_inds,
-            optimize=optimize, get=get, backend=backend,
-            preserve_tensor=preserve_tensor or (not contracting_all), **opts
+            tags, inplace=inplace, which=which
         )
 
-        if contracting_all:
+        if not tagged_ts:
+            raise ValueError(
+                "No tags were found - nothing to contract. "
+                "(Change this to a no-op maybe?)"
+            )
+
+        # whether we should let tensor_contract return a raw scalar
+        preserve_tensor = (
+            preserve_tensor or
+            inplace or
+            (untagged_tn.num_tensors >= 1)
+        )
+
+        contracted = tensor_contract(
+            *tagged_ts,
+            output_inds=output_inds,
+            optimize=optimize,
+            get=get,
+            backend=backend,
+            preserve_tensor=preserve_tensor,
+            **contract_opts
+        )
+
+        if (untagged_tn.num_tensors == 0) and (not inplace):
+            # contracted all down to single tensor or scalar -> return it
+            # (apart from if inplace -> we want to keep the tensor network)
             return contracted
 
         untagged_tn.add_tensor(contracted, virtual=True)
@@ -7311,10 +7691,10 @@ class TensorNetwork(object):
                 return self.contract_structured(tags, inplace=inplace, **opts)
 
         # contracting everything to single output
-        if all_tags:
+        if all_tags and not inplace:
             return tensor_contract(*self.tensor_map.values(), **opts)
 
-        # else just contract those tensors specified by tags.
+        # contract some or all tensors, but keeping tensor network
         return self.contract_tags(tags, inplace=inplace, **opts)
 
     contract_ = functools.partialmethod(contract, inplace=True)
@@ -7323,6 +7703,8 @@ class TensorNetwork(object):
         self,
         tags_seq,
         output_inds=None,
+        preserve_tensor=False,
+        equalize_norms=False,
         inplace=False,
         **opts
     ):
@@ -7339,6 +7721,9 @@ class TensorNetwork(object):
             The indices to specify as outputs of the contraction. If not given,
             and the tensor network has no hyper-indices, these are computed
             automatically as every index appearing once.
+        preserve_tensor : bool, optional
+            Whether to return a tensor regardless of whether the output object
+            is a scalar (has no indices) or not.
         inplace : bool, optional
             Whether to perform the contraction inplace.
         opts
@@ -7362,16 +7747,19 @@ class TensorNetwork(object):
             c_tags |= tags_to_oset(tags)
 
             # peform the next contraction
-            tn = tn.contract_tags(c_tags, inplace=True, which='any', **opts)
+            tn.contract_tags_(c_tags, which='any', **opts)
 
-            if not isinstance(tn, TensorNetwork):
+            if tn.num_tensors == 1:
                 # nothing more to contract
                 break
 
-        if isinstance(tn, Tensor) and output_inds is not None:
-            tn.transpose_(*output_inds)
-
-        return tn
+        return maybe_unwrap(
+            tn,
+            preserve_tensor_network=inplace,
+            preserve_tensor=preserve_tensor,
+            equalize_norms=equalize_norms,
+            output_inds=output_inds,
+        )
 
     def contraction_path(self, optimize=None, **contract_opts):
         """Compute the contraction path, a sequence of (int, int), for
@@ -7467,6 +7855,14 @@ class TensorNetwork(object):
         """
         return TensorNetwork((self, other)) ^ ...
 
+    def as_network(self, virtual=True):
+        """Matching method (for ensuring object is a tensor network) to
+        :meth:`~quimb.tensor.tensor_core.Tensor.as_network`, which simply
+        returns ``self`` if ``virtual=True``.
+        """
+        return self if virtual else self.copy()
+
+
     def aslinearoperator(self, left_inds, right_inds, ldims=None, rdims=None,
                          backend=None, optimize=None):
         """View this ``TensorNetwork`` as a
@@ -7495,7 +7891,7 @@ class TensorNetwork(object):
         tn = self.reindex({u: l for u, l in zip(left_inds, right_inds)})
         return tn.contract_tags(..., **contract_opts)
 
-    def to_dense(self, *inds_seq, to_qarray=True, **contract_opts):
+    def to_dense(self, *inds_seq, to_qarray=False, **contract_opts):
         """Convert this network into an dense array, with a single dimension
         for each of inds in ``inds_seqs``. E.g. to convert several sites
         into a density matrix: ``TN.to_dense(('k0', 'k1'), ('b0', 'b1'))``.
@@ -7508,6 +7904,8 @@ class TensorNetwork(object):
             **contract_opts
         )
         return t.to_dense(*inds_seq, to_qarray=to_qarray)
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     def compute_reduced_factor(
         self,
@@ -7558,42 +7956,20 @@ class TensorNetwork(object):
         if side == "right":
             # form dag(X) @ X --> left_inds are contracted
             ixmap = {ix: rand_uuid() for ix in right_inds}
-            if d0 < d1:
-                # know exactly low-rank, so truncate
-                keep = d0
-            else:
-                keep = None
         else:  # 'left'
             # form X @ dag(X) --> right_inds are contracted
             ixmap = {ix: rand_uuid() for ix in left_inds}
-            if d1 < d0:
-                # know exactly low-rank, so truncate
-                keep = d1
-            else:
-                keep = None
 
         # contract to dense array
         tnd = self.reindex(ixmap).conj_() & self
         XX = tnd.to_dense(
-            ixmap.values(), ixmap.keys(), optimize=optimize, **contract_opts
+            ixmap.values(), ixmap.keys(),
+            optimize=optimize, **contract_opts
         )
-        s2, W = do("linalg.eigh", XX)
 
-        if keep is not None:
-            # outer dimension smaller -> exactly low-rank
-            s2 = s2[-keep:]
-            W = W[:, -keep:]
-
-        # might have negative eigenvalues due to numerical error from squaring
-        s2 = do("clip", s2, s2[-1] * 1e-12, None)
-        s = do("sqrt", s2)
-
-        if side == "right":
-            factor = decomp.ldmul(s, dag(W))
-        else:  # 'left'
-            factor = decomp.rdmul(W, s)
-
-        return factor
+        return decomp.squared_op_to_reduced_factor(
+            XX, d0, d1, right=(side == "right"),
+        )
 
     def insert_compressor_between_regions(
         self,
@@ -7606,6 +7982,7 @@ class TensorNetwork(object):
         new_tags=None,
         new_ltags=None,
         new_rtags=None,
+        bond_ind=None,
         optimize="auto-hq",
         inplace=False,
         **compress_opts,
@@ -7657,6 +8034,9 @@ class TensorNetwork(object):
         if compress_opts.pop("absorb", "both") != "both":
             raise NotImplementedError("Only `absorb=both` supported.")
 
+        if bond_ind is None:
+            bond_ind = rand_uuid()
+
         tn = self if (inplace or (insert_into is not None)) else self.copy()
 
         # get views of the left and right regions - 'X' and 'Y'
@@ -7671,18 +8051,16 @@ class TensorNetwork(object):
         Rl = ltn.compute_reduced_factor("right", None, bix, optimize=optimize)
         Rr = rtn.compute_reduced_factor("left", bix, None, optimize=optimize)
 
-        # then combine and perform truncated SVD on these
-        Ut, st, VHt = decomp.svd_truncated(
-            Rl @ Rr, max_bond=max_bond, cutoff=cutoff,
-            absorb=None, **compress_opts
-        )
-        st_sqrt = do("sqrt", st)
-
         # then form the 'oblique' projectors
-        Pl = Rr @ decomp.rddiv(dag(VHt), st_sqrt)
-        Pl = reshape(Pl, (*bix_sizes, -1))
-        Pr = decomp.lddiv(st_sqrt, dag(Ut)) @ Rl
-        Pr = reshape(Pr, (-1, *bix_sizes))
+        Pl, Pr = decomp.compute_oblique_projectors(
+            Rl, Rr,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            **compress_opts,
+        )
+
+        Pl = do("reshape", Pl, (*bix_sizes, -1))
+        Pr = do("reshape", Pr, (-1, *bix_sizes))
 
         if insert_into is not None:
             tn = insert_into
@@ -7692,7 +8070,7 @@ class TensorNetwork(object):
         # finally cut the bonds
         new_lix = [rand_uuid() for _ in bix]
         new_rix = [rand_uuid() for _ in bix]
-        new_bix = [rand_uuid()]
+        new_bix = [bond_ind]
         ltn.reindex_(dict(zip(bix, new_lix)))
         rtn.reindex_(dict(zip(bix, new_rix)))
 
@@ -7770,6 +8148,8 @@ class TensorNetwork(object):
         fitting_opts['tol'] = tol
         fitting_opts['inplace'] = inplace
         fitting_opts['progbar'] = progbar
+
+        tn_target = tn_target.as_network()
 
         if method == 'autodiff':
             return tensor_network_fit_autodiff(self, tn_target, **fitting_opts)
@@ -8799,6 +9179,24 @@ class TensorNetwork(object):
 
         if tids is None:
             tids = self.tensor_map
+
+        try:
+            from cotengra import get_hypergraph
+            hg = get_hypergraph(
+                {
+                    tid: t.inds
+                    for tid, t in self.tensor_map.items()
+                }, accel="auto",
+            )
+            for ix in exclude_inds:
+                hg.remove_edge(ix)
+            y = hg.all_shortest_distances_condensed(tuple(tids))
+            return hierarchy.linkage(
+                y, method=method, optimal_ordering=optimal_ordering
+            )
+        except ImportError:
+            pass
+
         distances = self.compute_shortest_distances(tids, exclude_inds)
 
         dinf = 10  * self.num_tensors
@@ -9500,22 +9898,61 @@ class TensorNetwork(object):
         for tid, t in self.__dict__['tensor_map'].items():
             t.add_owner(self, tid=tid)
 
+    def _repr_info(self):
+        """General info to show in various reprs. Sublasses can add more
+        relevant info to this dict.
+        """
+        return {
+            'tensors': self.num_tensors,
+            'indices': self.num_indices,
+        }
+
+    def _repr_info_str(self):
+        """Render the general info as a string.
+        """
+        return ", ".join(
+            "{}={}".format(k, f"'{v}'" if isinstance(v, str) else v)
+            for k, v in self._repr_info().items()
+        )
+
+    def _repr_html_(self):
+        """Render this TensorNetwork as HTML, for Jupyter notebooks.
+        """
+        s = "<samp>"
+        s += "<details>"
+        s += "<summary>"
+        s += f"{auto_color_html(self.__class__.__name__)}"
+        s += f"({self._repr_info_str()})"
+        s += "</summary>"
+        for t in self:
+            s += t._repr_html_()
+        s += "</details>"
+        s += "</samp>"
+        return s
+
     def __str__(self):
-        return "{}([{}{}{}])".format(
-            self.__class__.__name__,
-            os.linesep,
-            "".join(["    " + repr(t) + "," + os.linesep
-                     for t in self.tensors[:-1]]),
-            "    " + repr(self.tensors[-1]) + "," + os.linesep)
+        return (
+            f"{self.__class__.__name__}([{os.linesep}" +
+            "".join(
+                f"    {repr(t)},{os.linesep}"
+                for t in self.tensors
+            ) +
+            f"], {self._repr_info_str()})"
+        )
 
     def __repr__(self):
-        rep = f"<{self.__class__.__name__}("
-        rep += f"tensors={self.num_tensors}"
-        rep += f", indices={self.num_indices}"
-
-        return rep + ")>"
+        return f"{self.__class__.__name__}({self._repr_info_str()})"
 
     draw = draw_tn
+    draw_3d = functools.partialmethod(
+        draw, dim=3, backend='matplotlib3d'
+    )
+    draw_interactive = functools.partialmethod(
+        draw, backend='plotly'
+    )
+    draw_3d_interactive = functools.partialmethod(
+        draw, dim=3, backend='plotly'
+    )
     graph = draw_tn
 
 
@@ -9614,7 +10051,7 @@ class TNLinearOperator(spla.LinearOperator):
         super().__init__(dtype=self._tensors[0].dtype, shape=(ld, rd))
 
     def _matvec(self, vec):
-        in_data = reshape(vec, self.rdims)
+        in_data = do("reshape", vec, self.rdims)
 
         if self.is_conj:
             in_data = conj(in_data)
@@ -9637,7 +10074,7 @@ class TNLinearOperator(spla.LinearOperator):
 
     def _matmat(self, mat):
         d = mat.shape[-1]
-        in_data = reshape(mat, (*self.rdims, d))
+        in_data = do("reshape", mat, (*self.rdims, d))
 
         if self.is_conj:
             in_data = conj(in_data)
@@ -9660,7 +10097,7 @@ class TNLinearOperator(spla.LinearOperator):
         if self.is_conj:
             out_data = conj(out_data)
 
-        return reshape(out_data, (-1, d))
+        return do("reshape", out_data, (-1, d))
 
     def trace(self):
         if 'trace' not in self._contractors:
@@ -9703,7 +10140,7 @@ class TNLinearOperator(spla.LinearOperator):
             self._adjoint_linop = self.copy(conj=True, transpose=True)
         return self._adjoint_linop
 
-    def to_dense(self, *inds_seq, **contract_opts):
+    def to_dense(self, *inds_seq, to_qarray=False, **contract_opts):
         """Convert this TNLinearOperator into a dense array, defaulting to
         grouping the left and right indices respectively.
         """
@@ -9717,7 +10154,11 @@ class TNLinearOperator(spla.LinearOperator):
         if not inds_seq:
             inds_seq = self.left_inds, self.right_inds
 
-        return tensor_contract(*ts, **contract_opts).to_dense(*inds_seq)
+        return tensor_contract(*ts, **contract_opts).to_dense(
+            *inds_seq, to_qarray=to_qarray,
+        )
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     @functools.wraps(tensor_split)
     def split(self, **split_opts):
@@ -9787,33 +10228,38 @@ class PTensor(Tensor):
     PTensor
     """
 
-    __slots__ = ('_parray', '_inds', '_tags', '_left_inds', '_owners')
+    __slots__ = ('_data', '_inds', '_tags', '_left_inds', '_owners')
 
     def __init__(self, fn, params, inds=(), tags=None, left_inds=None):
         super().__init__(
-            PArray(fn, params), inds=inds, tags=tags, left_inds=left_inds)
+            PArray(fn, params),
+            inds=inds,
+            tags=tags,
+            left_inds=left_inds,
+        )
 
     @classmethod
     def from_parray(cls, parray, inds=(), tags=None, left_inds=None):
         obj = cls.__new__(cls)
         super(PTensor, obj).__init__(
-            parray, inds=inds, tags=tags, left_inds=left_inds)
+            parray,
+            inds=inds,
+            tags=tags,
+            left_inds=left_inds,
+        )
         return obj
 
     def copy(self):
         """Copy this parametrized tensor.
         """
-        return PTensor.from_parray(self._parray.copy(), inds=self.inds,
-                                   tags=self.tags, left_inds=self.left_inds)
+        return PTensor.from_parray(
+            self._data.copy(),
+            inds=self.inds,
+            tags=self.tags,
+            left_inds=self.left_inds
+        )
 
-    @property
-    def _data(self):
-        """Make ``_data`` read-only and handle conjugation lazily.
-        """
-        return self._parray.data
-
-    @_data.setter
-    def _data(self, x):
+    def _set_data(self, x):
         if not isinstance(x, PArray):
             raise TypeError(
                 "You can only directly update the data of a ``PTensor`` with "
@@ -9821,29 +10267,29 @@ class PTensor(Tensor):
                 "``.modify(apply=fn)`` method. Alternatively you can convert "
                 "this ``PTensor to a normal ``Tensor`` with "
                 "``t.unparametrize()``")
-        self._parray = x
+        self._data = x
 
     @property
     def data(self):
-        return self._data
+        return self._data.data
 
     @property
     def fn(self):
-        return self._parray.fn
+        return self._data.fn
 
     @fn.setter
     def fn(self, x):
-        self._parray.fn = x
+        self._data.fn = x
 
     def get_params(self):
         """Get the parameters of this ``PTensor``.
         """
-        return self._parray.params
+        return self._data.params
 
     def set_params(self, params):
         """Set the parameters of this ``PTensor``.
         """
-        self._parray.params = params
+        self._data.params = params
 
     @property
     def params(self):
@@ -9855,13 +10301,19 @@ class PTensor(Tensor):
 
     @property
     def shape(self):
-        return self._parray.shape
+        return self._data.shape
+
+    @property
+    def backend(self):
+        """The backend inferred from the data.
+        """
+        return infer_backend(self.params)
 
     def _apply_function(self, fn):
         """Apply ``fn`` to the data array of this ``PTensor`` (lazily), by
         composing it with the current parametrized array function.
         """
-        self._parray.add_function(fn)
+        self._data.add_function(fn)
 
     def conj(self, inplace=False):
         """Conjugate this parametrized tensor - done lazily whenever the
@@ -9876,14 +10328,19 @@ class PTensor(Tensor):
     def unparametrize(self):
         """Turn this PTensor into a normal Tensor.
         """
-        return Tensor(self)
+        return Tensor(
+            data=self.data,
+            inds=self.inds,
+            tags=self.tags,
+            left_inds=self.left_inds,
+        )
 
     def __getstate__(self):
-        # Save _parray directly
-        return self._parray, self._inds, self._tags, self._left_inds
+        # Save _data directly
+        return self._data, self._inds, self._tags, self._left_inds
 
     def __setstate__(self, state):
-        self._parray, self._inds, tags, self._left_inds = state
+        self._data, self._inds, tags, self._left_inds = state
         self._tags = tags.copy()
         self._owners = {}
 

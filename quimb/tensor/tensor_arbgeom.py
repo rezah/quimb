@@ -166,14 +166,30 @@ class TensorNetworkGen(TensorNetwork):
             for e in TensorNetworkGen._EXTRA_PROPS
         )
 
-    def __and__(self, other):
-        new = TensorNetwork.__and__(self, other)
-        if self._compatible_arbgeom(other):
-            new.view_as_(TensorNetworkGen, like=self)
-        return new
+    def combine(self, other, *, virtual=False, check_collisions=True):
+        """Combine this tensor network with another, returning a new tensor
+        network. If the two are compatible, cast the resulting tensor network
+        to a :class:`TensorNetworkGen` instance.
 
-    def __or__(self, other):
-        new = TensorNetwork.__or__(self, other)
+        Parameters
+        ----------
+        other : TensorNetworkGen or TensorNetwork
+            The other tensor network to combine with.
+        virtual : bool, optional
+            Whether the new tensor network should copy all the incoming tensors
+            (``False``, the default), or view them as virtual (``True``).
+        check_collisions : bool, optional
+            Whether to check for index collisions between the two tensor
+            networks before combining them. If ``True`` (the default), any
+            inner indices that clash will be mangled.
+
+        Returns
+        -------
+        TensorNetworkGen or TensorNetwork
+        """
+        new = super().combine(
+            other, virtual=virtual, check_collisions=check_collisions
+        )
         if self._compatible_arbgeom(other):
             new.view_as_(TensorNetworkGen, like=self)
         return new
@@ -519,7 +535,7 @@ class TensorNetworkGenVector(TensorNetworkGen):
     def to_dense(
         self,
         *inds_seq,
-        to_qarray=True,
+        to_qarray=False,
         to_ket=None,
         **contract_opts
     ):
@@ -563,6 +579,8 @@ class TensorNetworkGenVector(TensorNetworkGen):
             x = do("reshape", x, (-1, 1))
 
         return x
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     def gate(
         self, G, where,
@@ -1484,7 +1502,7 @@ class TensorNetworkGenOperator(TensorNetworkGen):
     def to_dense(
         self,
         *inds_seq,
-        to_qarray=True,
+        to_qarray=False,
         **contract_opts
     ):
         """Contract this tensor network 'operator' into a dense array.
@@ -1514,6 +1532,8 @@ class TensorNetworkGenOperator(TensorNetworkGen):
             to_qarray=to_qarray,
             **contract_opts
         )
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     def phys_dim(self, site=None, which='upper'):
         """Get the physical dimension of ``site``.
