@@ -63,6 +63,7 @@ class TestBasicTensorOperations:
     def test_tensor_copy(self):
         a = Tensor(np.random.randn(2, 3, 4), inds=[0, 1, 2], tags="blue")
         b = a.copy()
+        b.check()
         b.add_tag("foo")
         assert "foo" not in a.tags
         b.data[:] = b.data / 2
@@ -144,6 +145,7 @@ class TestBasicTensorOperations:
         assert a.shared_bond_size(b) == 12
 
         c = a @ b
+        c.check()
 
         assert isinstance(c, Tensor)
         assert c.shape == (2, 5)
@@ -160,6 +162,7 @@ class TestBasicTensorOperations:
         a = Tensor(np.random.randn(2, 3, 4), inds=[0, 1, 2])
         b = Tensor(np.random.randn(3, 4, 5), inds=[3, 4, 5])
         c = a @ b
+        c.check()
         assert c.shape == (2, 3, 4, 3, 4, 5)
         assert c.inds == (0, 1, 2, 3, 4, 5)
 
@@ -181,6 +184,7 @@ class TestBasicTensorOperations:
         b = Tensor(np.random.randn(3, 4, 5), inds=[1, 2, 3], tags="blue")
         c = Tensor(np.random.randn(5, 2, 6), inds=[3, 0, 4], tags="blue")
         d = tensor_contract(a, b, c)
+        d.check()
         assert isinstance(d, Tensor)
         assert d.shape == (6,)
         assert d.inds == (4,)
@@ -312,6 +316,22 @@ class TestBasicTensorOperations:
         assert_allclose(tc.data, t.data.sum(axis=2))
         with pytest.raises(ValueError):
             t.sum_reduce_("d")
+
+    def test_vector_reduce(self):
+        t = rand_tensor((2, 3, 4), "abc")
+        g = qu.randn(3)
+        tv = t.vector_reduce('b', g)
+        assert tv.shape == (2, 4)
+        assert tv.inds == ('a', 'c')
+        assert_allclose(tv.data, np.einsum('abc,b->ac', t.data, g))
+
+    def test_sum_reduce(self):
+        t = rand_tensor((2, 3, 4), "abc")
+        x = np.einsum('abc->ac', t.data)
+        t.sum_reduce_("b")
+        assert t.shape == (2, 4)
+        assert t.inds == ('a', 'c')
+        assert_allclose(t.data, x)
 
     def test_ownership(self):
         a = rand_tensor((2, 2), ("a", "b"), tags={"X", "Y"})
@@ -1071,8 +1091,10 @@ class TestTensorNetwork:
         c = Tensor(np.random.randn(5, 2, 6), inds=[3, 0, 4], tags="green")
 
         a_b_c = a & b & c
+        a_b_c.check()
 
         d = a_b_c.reindex({4: "foo", 2: "bar"})
+        d.check()
 
         assert a_b_c.outer_inds() == (4,)
         assert d.outer_inds() == ("foo",)
@@ -1211,6 +1233,7 @@ class TestTensorNetwork:
         )
 
         tn = A & B & C & D
+        tn.check()
 
         with pytest.raises(ValueError):
             tn.replace_with_identity(("I1", "I2"), inplace=True)
@@ -1219,6 +1242,7 @@ class TestTensorNetwork:
         tn["I3"] = rand_tensor((4,), "f", tags=["I3"])
 
         tn1 = tn.replace_with_identity(("I1", "I2"))
+        tn1.check()
         assert len(tn1.tensors) == 2
         x = tn1 ^ ...
         assert set(x.inds) == {"a", "b"}
@@ -1385,6 +1409,7 @@ class TestTensorNetwork:
         mps = MPS_rand_state(4, 3)
         right_inds = bonds(mps[1], mps[2])
         mps.split_tensor(1, left_inds=None, right_inds=right_inds, rtags="X")
+        mps.check()
         assert mps.num_tensors == 5
         assert mps["X"].shape == (3, 3)
         assert mps.H @ mps == pytest.approx(1.0)
@@ -1561,6 +1586,30 @@ class TestTensorNetwork:
         p2 = stn2.contract(output_inds=output_inds).data
         assert_allclose(pex, p2)
 
+    def test_istree(self):
+        assert Tensor().as_network().istree()
+        tn = rand_tensor([2] * 1, ['x']).as_network()
+        assert tn.istree()
+        tn |= rand_tensor([2] * 3, ['x', 'y', 'z'])
+        assert tn.istree()
+        tn |= rand_tensor([2] * 2, ['y', 'z'])
+        assert tn.istree()
+        tn |= rand_tensor([2] * 2, ['x', 'z'])
+        assert not tn.istree()
+
+    def test_isconnected(self):
+        assert Tensor().as_network().isconnected()
+        tn = rand_tensor([2] * 1, ['x']).as_network()
+        assert tn.isconnected()
+        tn |= rand_tensor([2] * 3, ['x', 'y', 'z'])
+        assert tn.isconnected()
+        tn |= rand_tensor([2] * 2, ['w', 'u'])
+        assert not tn.isconnected()
+        assert not (Tensor() | Tensor()).isconnected()
+
+    def test_get_string_between_tids(self):
+        tn = MPS_rand_state(5, 3)
+        assert tn._get_string_between_tids(0, 4) == (0, 1, 2, 3, 4)
 
 class TestTensorNetworkSimplifications:
     def test_rank_simplify(self):
